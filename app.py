@@ -253,11 +253,11 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
         for i in indices:
             for s_idx, s in enumerate(slots):
                 if is_eligible(active.loc[i, "Position"], s):
-                    x[i, s] = pulp.LpVariable(f"x_{l_idx}_{i}_{s_idx}", cat=pulp.LpBinary)
+                    x[i, s] = pulp.LpVariable(f"x_{l_idx}_{i}_{s_idx}", cat="Binary")
                 else:
                     x[i, s] = 0
 
-        y = {i: pulp.LpVariable(f"y_{l_idx}_{i}", cat=pulp.LpBinary) for i in indices}
+        y = {i: pulp.LpVariable(f"y_{l_idx}_{i}", cat="Binary") for i in indices}
         for i in indices:
             prob += pulp.lpSum(x[i, s] for s in slots) == y[i]
 
@@ -282,7 +282,7 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
             prob += pulp.lpSum(y[i] for i in prev_y) <= 6
 
         games = [g for g in active["Game Info"].unique() if pd.notna(g)]
-        g_vars = {g: pulp.LpVariable(f"g_{l_idx}_{g_idx}", cat=pulp.LpBinary) for g_idx, g in enumerate(games)}
+        g_vars = {g: pulp.LpVariable(f"g_{l_idx}_{g_idx}", cat="Binary") for g_idx, g in enumerate(games)}
         for g in games:
             g_idx = active[active["Game Info"] == g].index
             prob += pulp.lpSum(y[i] for i in g_idx) >= g_vars[g]
