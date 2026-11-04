@@ -2,8 +2,8 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import pulp
 import io
+from scipy.optimize import milp, LinearConstraint, Bounds
 from nba_api.stats.endpoints import leaguedashplayerstats, leaguedashteamstats
 
 st.set_page_config(
@@ -13,9 +13,8 @@ st.set_page_config(
 )
 
 st.title("🏀 DraftKings NBA DFS 5-Lineup Multi-Entry Engine")
-st.caption("Live Slate / CSV Ingestion • Pace & Usage Redistribution • Zero-Crash Linear Program")
+st.caption("Live Slate / CSV Ingestion • Pace & Usage Adjustments • Native SciPy MILP Solver (Zero Subprocess Dependencies)")
 
-# --- BROWSER HEADERS ---
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -27,7 +26,6 @@ DK_HEADERS = {
 # --- 1. SLATE DATA FETCHERS & FALLBACK ---
 @st.cache_data(ttl=600)
 def fetch_dk_nba_contests():
-    """Scans DraftKings lobby for active NBA slates."""
     url = "https://www.draftkings.com/lobby/getcontests?sport=NBA"
     try:
         res = requests.get(url, headers=DK_HEADERS, timeout=8)
@@ -47,7 +45,6 @@ def fetch_dk_nba_contests():
 
 @st.cache_data(ttl=600)
 def fetch_dk_players_by_draftgroup(draft_group_id):
-    """Pulls full active player pool for a DraftGroup without crashing on 403/HTML."""
     if not draft_group_id:
         return pd.DataFrame()
     url = f"https://api.draftkings.com/draftgroups/v1/draftgroups/{draft_group_id}/draftables?format=json"
@@ -79,7 +76,6 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
         return pd.DataFrame()
 
 def load_demo_slate():
-    """Fallback interactive demo slate when cloud host IP is blocked by DraftKings firewall."""
     return pd.DataFrame([
         {"Name": "Luka Doncic", "Position": "PG", "Salary": 11600, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "MIN": 37.2, "Base_Proj": 58.4},
         {"Name": "Nikola Jokic", "Position": "C", "Salary": 11400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 35.8, "Base_Proj": 60.1},
@@ -98,10 +94,9 @@ def load_demo_slate():
         {"Name": "Cason Wallace", "Position": "PG/SG", "Salary": 3800, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "MIN": 20.0, "Base_Proj": 18.0},
     ])
 
-# --- 2. NBA STATS & PACE ENGINE ---
+# --- 2. STATS & ADJUSTMENTS ---
 @st.cache_data(ttl=3600)
 def fetch_nba_stats():
-    """Pulls player averages & team pace from official NBA stats."""
     try:
         dash = leaguedashplayerstats.LeagueDashPlayerStats(
             per_mode_detailed='PerGame',
@@ -109,7 +104,6 @@ def fetch_nba_stats():
             season_type_all_star='Regular Season'
         )
         p_df = dash.get_data_frames()[0]
-
         p_df["Base_DK_FPTS"] = (
             p_df["PTS"] * 1.0 +
             p_df["FG3M"] * 0.5 +
@@ -119,12 +113,7 @@ def fetch_nba_stats():
             p_df["BLK"] * 2.0 -
             p_df["TOV"] * 0.5
         )
-        p_df["DD_Bonus"] = (
-            ((p_df["PTS"] >= 10).astype(int) + 
-             (p_df["REB"] >= 10).astype(int) + 
-             (p_df["AST"] >= 10).astype(int)) >= 2
-        ).astype(int) * 1.5
-
+        p_df["DD_Bonus"] = (((p_df["PTS"] >= 10).astype(int) + (p_df["REB"] >= 10).astype(int) + (p_df["AST"] >= 10).astype(int)) >= 2).astype(int) * 1.5
         p_df["Season_FPTS"] = (p_df["Base_DK_FPTS"] + p_df["DD_Bonus"]).round(2)
         player_clean = p_df[["PLAYER_NAME", "MIN", "Season_FPTS"]].copy()
 
@@ -155,7 +144,6 @@ def fetch_nba_stats():
         return pd.DataFrame(), pd.DataFrame()
 
 def apply_pace_and_matchups(df, pace_df):
-    """Calculates Pace Multiplier based on expected possessions."""
     if pace_df.empty or "Game Info" not in df.columns:
         df["Pace_Factor"] = 1.0
         return df
@@ -181,10 +169,8 @@ def apply_pace_and_matchups(df, pace_df):
     return df
 
 def reallocate_vacated_usage(df_pool, scratched_players):
-    """Zeroes out scratched players and redistributes their minutes & usage to active teammates."""
     df = df_pool.copy()
     df["Is_Out"] = df["Name"].isin(scratched_players)
-    
     df["USG%"] = np.clip(14.0 + (df["Salary"] - 3500) * (20.0 / 8500), 12.0, 36.0)
     df["FPPM"] = np.where(df["MIN"] > 0, df["Base_Proj"] / df["MIN"], df["Salary"] / 24000.0)
 
@@ -221,10 +207,12 @@ def reallocate_vacated_usage(df_pool, scratched_players):
     result_df["Value (x/1k)"] = (result_df["Projected_FPTS"] / (result_df["Salary"] / 1000)).round(2)
     return result_df
 
-# --- 3. PYTHON 3.14 COMPATIBLE 5-LINEUP OPTIMIZER ---
-def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposure=0.60, target_stack=None, stack_size=3):
+# --- 3. SCIPY MILP SOLVER (NATIVE C-HIGHS, NO PU-LP, NO SUBPROCESS) ---
+def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_exposure=0.60, target_stack=None, stack_size=3):
     active = pool_df[~pool_df["Name"].isin(excludes or [])].copy().reset_index(drop=True)
     slots = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
+    n_slots = len(slots)
+    n_players = len(active)
 
     def is_eligible(pos_str, slot):
         pos = [p.strip() for p in str(pos_str).split("/")]
@@ -236,109 +224,176 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
             return any(p in ["SF", "PF"] for p in pos)
         return slot in pos
 
-    n_players = len(active)
-    indices = list(range(n_players))
+    # Eligible matrix E[i, s]
+    E = np.zeros((n_players, n_slots), dtype=int)
+    for i in range(n_players):
+        for s_idx, s in enumerate(slots):
+            if is_eligible(active.loc[i, "Position"], s):
+                E[i, s_idx] = 1
+
+    games = [g for g in active["Game Info"].unique() if pd.notna(g)]
+    n_games = len(games)
+
+    # Decision variables:
+    # x[i, s] -> n_players * n_slots
+    # y[i]    -> n_players
+    # g[g_idx]-> n_games
+    total_vars = (n_players * n_slots) + n_players + n_games
+    
+    def var_x(i, s): return i * n_slots + s
+    def var_y(i): return (n_players * n_slots) + i
+    def var_g(g_idx): return (n_players * n_slots) + n_players + g_idx
+
+    # Objective: Maximize Projected Points (SciPy minimizes, so negate values)
+    c = np.zeros(total_vars)
+    for i in range(n_players):
+        c[var_y(i)] = -float(active.loc[i, "Projected_FPTS"])
+
+    # Binary upper bounds
+    ub = np.ones(total_vars)
+    lb = np.zeros(total_vars)
+
+    # Force x[i, s] = 0 if not eligible
+    for i in range(n_players):
+        for s in range(n_slots):
+            if E[i, s] == 0:
+                ub[var_x(i, s)] = 0
+
+    # Locked players: force y[i] = 1
+    for lock in (locks or []):
+        lock_idx = active[active["Name"] == lock].index
+        if len(lock_idx) > 0:
+            lb[var_y(lock_idx[0])] = 1
+
+    # Base constraints
+    rows, lower, upper = [], [], []
+
+    # 1. Exactly 1 player per slot
+    for s in range(n_slots):
+        row = np.zeros(total_vars)
+        for i in range(n_players):
+            row[var_x(i, s)] = 1
+        rows.append(row)
+        lower.append(1.0)
+        upper.append(1.0)
+
+    # 2. Linking: sum_s x[i, s] - y[i] = 0
+    for i in range(n_players):
+        row = np.zeros(total_vars)
+        for s in range(n_slots):
+            row[var_x(i, s)] = 1
+        row[var_y(i)] = -1
+        rows.append(row)
+        lower.append(0.0)
+        upper.append(0.0)
+
+    # 3. Salary cap: sum_i Salary[i] * y[i] <= cap
+    row = np.zeros(total_vars)
+    for i in range(n_players):
+        row[var_y(i)] = int(active.loc[i, "Salary"])
+    rows.append(row)
+    lower.append(0.0)
+    upper.append(float(cap))
+
+    # 4. Unique game linking
+    for g_idx, g in enumerate(games):
+        p_indices = active[active["Game Info"] == g].index
+        row1 = np.zeros(total_vars)
+        for i in p_indices:
+            row1[var_y(i)] = 1
+        row1[var_g(g_idx)] = -1
+        rows.append(row1)
+        lower.append(0.0)
+        upper.append(np.inf)
+
+        row2 = np.zeros(total_vars)
+        for i in p_indices:
+            row2[var_y(i)] = 1
+        row2[var_g(g_idx)] = -8
+        rows.append(row2)
+        lower.append(-np.inf)
+        upper.append(0.0)
+
+    # 5. Min 2 games
+    row = np.zeros(total_vars)
+    for g_idx in range(n_games):
+        row[var_g(g_idx)] = 1
+    rows.append(row)
+    lower.append(2.0)
+    upper.append(np.inf)
+
+    # 6. Target game stack
+    if target_stack and target_stack != "None":
+        stk_rows = active[active["Game Info"].str.contains(target_stack, case=False, na=False)]
+        if len(stk_rows) >= stack_size:
+            row = np.zeros(total_vars)
+            for i in stk_rows.index:
+                row[var_y(i)] = 1
+            rows.append(row)
+            lower.append(float(stack_size))
+            upper.append(np.inf)
+
+            teams = stk_rows["TeamAbbrev"].unique()
+            if len(teams) == 2:
+                for t in teams:
+                    t_idx = stk_rows[stk_rows["TeamAbbrev"] == t].index
+                    row_t = np.zeros(total_vars)
+                    for i in t_idx:
+                        row_t[var_y(i)] = 1
+                    rows.append(row_t)
+                    lower.append(1.0)
+                    upper.append(np.inf)
+
+    # Iterative solving for 5 distinct lineups
     num_lineups = 5
     max_appearances = max(1, int(round(num_lineups * max_exposure)))
-    
-    player_usage_count = {i: 0 for i in indices}
-    lineup_history = []
+    player_usage_count = np.zeros(n_players, dtype=int)
+    history_rows = []
     generated_lineups = []
 
     for l_idx in range(num_lineups):
-        prob = pulp.LpProblem(f"DK_Lineup_{l_idx}", pulp.LpMaximize)
+        iter_rows = list(rows)
+        iter_lower = list(lower)
+        iter_upper = list(upper)
+        current_ub = np.array(ub)
 
-        # Python 3.14 safe integer variable declaration (0 to 1 bounds avoid LpVariable constructor bugs)
-        x = {}
-        for i in indices:
-            x[i] = {}
-            for s in slots:
-                if is_eligible(active.loc[i, "Position"], s):
-                    var_name = f"x_{l_idx}_{i}_{s}"
-                    x[i][s] = pulp.LpVariable(name=var_name, lowBound=0, upBound=1, cat="Integer")
-                else:
-                    x[i][s] = 0
-
-        y = {}
-        for i in indices:
-            y[i] = pulp.LpVariable(name=f"y_{l_idx}_{i}", lowBound=0, upBound=1, cat="Integer")
-
-        # Link player indicator to slot usage
-        for i in indices:
-            prob += pulp.lpSum(x[i][s] for s in slots) == y[i]
-
-        # Maximize total projected points
-        prob += pulp.lpSum(float(active.loc[i, "Projected_FPTS"]) * y[i] for i in indices)
-
-        # 1 player per roster slot
-        for s in slots:
-            prob += pulp.lpSum(x[i][s] for i in indices) == 1
-
-        # Max 1 selection per player
-        for i in indices:
-            prob += pulp.lpSum(x[i][s] for s in slots) <= 1
-
-        # Salary cap
-        prob += pulp.lpSum(int(active.loc[i, "Salary"]) * y[i] for i in indices) <= cap
-
-        # Lock core players
-        for lock in (locks or []):
-            lock_idx = active[active["Name"] == lock].index
-            if len(lock_idx) > 0:
-                prob += y[lock_idx[0]] == 1
-
-        # Max exposure cap across lineups
-        for i in indices:
+        # Exposure constraints
+        for i in range(n_players):
             if player_usage_count[i] >= max_appearances and active.loc[i, "Name"] not in (locks or []):
-                prob += y[i] == 0
+                current_ub[var_y(i)] = 0
 
-        # Overlap limit: Lineups must differ by at least 2 players
-        for prev_y in lineup_history:
-            prob += pulp.lpSum(y[i] for i in prev_y) <= 6
+        # Max overlap constraint (differs by >= 2 players)
+        for prev_y in history_rows:
+            row = np.zeros(total_vars)
+            for i in prev_y:
+                row[var_y(i)] = 1
+            iter_rows.append(row)
+            iter_lower.append(0.0)
+            iter_upper.append(6.0)
 
-        # Min 2 Games constraint
-        games = [g for g in active["Game Info"].unique() if pd.notna(g)]
-        g_vars = {}
-        for g_idx, g in enumerate(games):
-            g_vars[g_idx] = pulp.LpVariable(name=f"g_{l_idx}_{g_idx}", lowBound=0, upBound=1, cat="Integer")
-            p_in_game = active[active["Game Info"] == g].index
-            prob += pulp.lpSum(y[i] for i in p_in_game) >= g_vars[g_idx]
-            prob += pulp.lpSum(y[i] for i in p_in_game) <= 8 * g_vars[g_idx]
+        A = np.array(iter_rows)
+        constraints = LinearConstraint(A, iter_lower, iter_upper)
+        bounds = Bounds(lb, current_ub)
+        integrality = np.ones(total_vars) # 1 = Integer/Binary
 
-        prob += pulp.lpSum(g_vars[g_idx] for g_idx in range(len(games))) >= 2
+        res = milp(c=c, constraints=constraints, bounds=bounds, integrality=integrality)
 
-        # Optional Game Stacking with Bring-Back
-        if target_stack and target_stack != "None":
-            stk_rows = active[active["Game Info"].str.contains(target_stack, case=False, na=False)]
-            if len(stk_rows) >= stack_size:
-                teams = stk_rows["TeamAbbrev"].unique()
-                prob += pulp.lpSum(y[i] for i in stk_rows.index) >= stack_size
-                if len(teams) == 2:
-                    t1_idx = stk_rows[stk_rows["TeamAbbrev"] == teams[0]].index
-                    t2_idx = stk_rows[stk_rows["TeamAbbrev"] == teams[1]].index
-                    prob += pulp.lpSum(y[i] for i in t1_idx) >= 1
-                    prob += pulp.lpSum(y[i] for i in t2_idx) >= 1
-
-        # Solve
-        solver = pulp.PULP_CBC_CMD(msg=False)
-        prob.solve(solver)
-
-        if pulp.LpStatus[prob.status] != "Optimal":
+        if not res.success:
             break
 
-        selected_indices = [i for i in indices if pulp.value(y[i]) is not None and pulp.value(y[i]) > 0.5]
-        lineup_history.append(selected_indices)
-        for i in selected_indices:
+        sol = res.x
+        selected_i = [i for i in range(n_players) if sol[var_y(i)] > 0.5]
+        history_rows.append(selected_i)
+        for i in selected_i:
             player_usage_count[i] += 1
 
         roster_rows = []
-        for s in slots:
-            for i in indices:
-                val = pulp.value(x[i][s])
-                if val is not None and val > 0.5:
-                    row = active.loc[i].to_dict()
-                    row["Roster Slot"] = s
-                    roster_rows.append(row)
+        for s_idx, s in enumerate(slots):
+            for i in range(n_players):
+                if sol[var_x(i, s_idx)] > 0.5:
+                    r = active.loc[i].to_dict()
+                    r["Roster Slot"] = s
+                    roster_rows.append(r)
 
         roster_df = pd.DataFrame(roster_rows)
         order = {"PG": 0, "SG": 1, "SF": 2, "PF": 3, "C": 4, "G": 5, "F": 6, "UTIL": 7}
@@ -349,7 +404,7 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
 
     return generated_lineups
 
-# --- 4. SIDEBAR & USER CONTROLS ---
+# --- 4. SIDEBAR & INTERFACE ---
 st.sidebar.header("1. Slate Data Ingestion")
 data_mode = st.sidebar.radio("Data Ingestion Mode", ["Live DraftKings API", "Upload DKSalaries.csv"])
 
@@ -380,7 +435,6 @@ salary_cap = st.sidebar.number_input("Salary Cap ($)", value=50000, step=500)
 with st.spinner("Calculating projections & pace metrics..."):
     nba_player_stats, team_pace_stats = fetch_nba_stats()
 
-# Merge stats & calculate baseline
 if not nba_player_stats.empty:
     merged_df = pd.merge(slate_df, nba_player_stats, left_on="Name", right_on="PLAYER_NAME", how="left")
     merged_df["MIN"] = merged_df["MIN"].fillna(20.0).round(1)
@@ -417,13 +471,13 @@ slate_games = ["None"] + [g for g in pool_df["Game Info"].unique() if "@" in str
 game_stack = st.sidebar.selectbox("🎯 Target Game Stack", options=slate_games)
 stack_players = st.sidebar.slider("Min Players from Stacked Game", 2, 4, 3)
 
-# --- 5. TABS INTERFACE ---
+# --- 5. TABS ---
 tab_lineups, tab_portfolio, tab_pool = st.tabs(["⚡ 5 Optimized Lineups", "📊 Exposure Breakdown", "📋 Player Pool & Projections"])
 
 with tab_lineups:
     if st.button("🚀 Generate 5 Tournament Lineups", type="primary"):
-        with st.spinner("Solving multi-lineup linear integer program..."):
-            five_lineups = optimize_5_lineups(
+        with st.spinner("Solving multi-lineup linear integer program with SciPy..."):
+            five_lineups = optimize_5_lineups_scipy(
                 pool_df=pool_df,
                 locks=locks,
                 excludes=fades,
