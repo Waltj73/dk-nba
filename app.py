@@ -13,8 +13,9 @@ st.set_page_config(
 )
 
 st.title("🏀 DraftKings NBA DFS 5-Lineup Multi-Entry Engine")
-st.caption("Live Slate / CSV Ingestion • Pace & Usage Adjustments • Native SciPy MILP Solver (Zero Subprocess Dependencies)")
+st.caption("Live Slate / CSV Ingestion • Pace & Usage Adjustments • 75th/90th Ceiling Modeling • SciPy MILP Solver")
 
+# --- BROWSER HEADERS (Avoids Cloud Datacenter 403 Blocks) ---
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -26,6 +27,7 @@ DK_HEADERS = {
 # --- 1. SLATE DATA FETCHERS & FALLBACK ---
 @st.cache_data(ttl=600)
 def fetch_dk_nba_contests():
+    """Scans DraftKings lobby for active NBA slates."""
     url = "https://www.draftkings.com/lobby/getcontests?sport=NBA"
     try:
         res = requests.get(url, headers=DK_HEADERS, timeout=8)
@@ -45,6 +47,7 @@ def fetch_dk_nba_contests():
 
 @st.cache_data(ttl=600)
 def fetch_dk_players_by_draftgroup(draft_group_id):
+    """Pulls full active player pool for a DraftGroup without crashing on 403/HTML."""
     if not draft_group_id:
         return pd.DataFrame()
     url = f"https://api.draftkings.com/draftgroups/v1/draftgroups/{draft_group_id}/draftables?format=json"
@@ -76,6 +79,7 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
         return pd.DataFrame()
 
 def load_demo_slate():
+    """Fallback interactive demo slate when cloud host IP is blocked by DraftKings firewall."""
     return pd.DataFrame([
         {"Name": "Luka Doncic", "Position": "PG", "Salary": 11600, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "MIN": 37.2, "Base_Proj": 58.4},
         {"Name": "Nikola Jokic", "Position": "C", "Salary": 11400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 35.8, "Base_Proj": 60.1},
@@ -94,9 +98,10 @@ def load_demo_slate():
         {"Name": "Cason Wallace", "Position": "PG/SG", "Salary": 3800, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "MIN": 20.0, "Base_Proj": 18.0},
     ])
 
-# --- 2. STATS & ADJUSTMENTS ---
+# --- 2. NBA STATS & ADJUSTMENTS ---
 @st.cache_data(ttl=3600)
 def fetch_nba_stats():
+    """Pulls player averages & team pace from official NBA stats."""
     try:
         dash = leaguedashplayerstats.LeagueDashPlayerStats(
             per_mode_detailed='PerGame',
@@ -113,7 +118,12 @@ def fetch_nba_stats():
             p_df["BLK"] * 2.0 -
             p_df["TOV"] * 0.5
         )
-        p_df["DD_Bonus"] = (((p_df["PTS"] >= 10).astype(int) + (p_df["REB"] >= 10).astype(int) + (p_df["AST"] >= 10).astype(int)) >= 2).astype(int) * 1.5
+        p_df["DD_Bonus"] = (
+            ((p_df["PTS"] >= 10).astype(int) + 
+             (p_df["REB"] >= 10).astype(int) + 
+             (p_df["AST"] >= 10).astype(int)) >= 2
+        ).astype(int) * 1.5
+
         p_df["Season_FPTS"] = (p_df["Base_DK_FPTS"] + p_df["DD_Bonus"]).round(2)
         player_clean = p_df[["PLAYER_NAME", "MIN", "Season_FPTS"]].copy()
 
@@ -144,6 +154,7 @@ def fetch_nba_stats():
         return pd.DataFrame(), pd.DataFrame()
 
 def apply_pace_and_matchups(df, pace_df):
+    """Calculates Pace Multiplier based on expected possessions."""
     if pace_df.empty or "Game Info" not in df.columns:
         df["Pace_Factor"] = 1.0
         return df
@@ -169,6 +180,7 @@ def apply_pace_and_matchups(df, pace_df):
     return df
 
 def reallocate_vacated_usage(df_pool, scratched_players):
+    """Zeroes out scratched players and redistributes their minutes & usage to active teammates."""
     df = df_pool.copy()
     df["Is_Out"] = df["Name"].isin(scratched_players)
     df["USG%"] = np.clip(14.0 + (df["Salary"] - 3500) * (20.0 / 8500), 12.0, 36.0)
@@ -204,11 +216,35 @@ def reallocate_vacated_usage(df_pool, scratched_players):
         adjusted.append(actives)
 
     result_df = pd.concat(adjusted, ignore_index=True)
-    result_df["Value (x/1k)"] = (result_df["Projected_FPTS"] / (result_df["Salary"] / 1000)).round(2)
     return result_df
 
+def calculate_percentile_ceilings(df):
+    """
+    Computes 75th and 90th percentile ceiling outcomes based on player usage and minutes volatility.
+    """
+    df = df.copy()
+    # Volatility scales higher for lower-minute bench specialists than for core starters
+    min_factor = np.clip((36.0 - df["MIN"]) / 36.0, 0.0, 0.5)
+    cv = 0.20 + (min_factor * 0.15)  # CV: ~0.20 for 36m studs to ~0.35 for low-min punts
+
+    df["StdDev"] = (df["Projected_FPTS"] * cv).round(2)
+    # Parametric Gaussian percentiles (75th: z=0.674, 90th: z=1.282)
+    df["Ceiling_75"] = (df["Projected_FPTS"] + 0.674 * df["StdDev"]).round(2)
+    df["Ceiling_90"] = (df["Projected_FPTS"] + 1.282 * df["StdDev"]).round(2)
+    df["Value (x/1k)"] = (df["Projected_FPTS"] / (df["Salary"] / 1000)).round(2)
+    return df
+
 # --- 3. SCIPY MILP SOLVER (NATIVE C-HIGHS, NO PU-LP, NO SUBPROCESS) ---
-def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_exposure=0.60, target_stack=None, stack_size=3):
+def optimize_5_lineups_scipy(
+    pool_df, 
+    locks=None, 
+    excludes=None, 
+    cap=50000, 
+    max_exposure=0.60, 
+    target_stack=None, 
+    stack_size=3,
+    objective_metric="Ceiling_90"
+):
     active = pool_df[~pool_df["Name"].isin(excludes or [])].copy().reset_index(drop=True)
     slots = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
     n_slots = len(slots)
@@ -224,7 +260,6 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
             return any(p in ["SF", "PF"] for p in pos)
         return slot in pos
 
-    # Eligible matrix E[i, s]
     E = np.zeros((n_players, n_slots), dtype=int)
     for i in range(n_players):
         for s_idx, s in enumerate(slots):
@@ -234,38 +269,32 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
     games = [g for g in active["Game Info"].unique() if pd.notna(g)]
     n_games = len(games)
 
-    # Decision variables:
-    # x[i, s] -> n_players * n_slots
-    # y[i]    -> n_players
-    # g[g_idx]-> n_games
     total_vars = (n_players * n_slots) + n_players + n_games
     
     def var_x(i, s): return i * n_slots + s
     def var_y(i): return (n_players * n_slots) + i
     def var_g(g_idx): return (n_players * n_slots) + n_players + g_idx
 
-    # Objective: Maximize Projected Points (SciPy minimizes, so negate values)
+    # Objective: Maximize chosen metric (negated for SciPy minimization)
     c = np.zeros(total_vars)
     for i in range(n_players):
-        c[var_y(i)] = -float(active.loc[i, "Projected_FPTS"])
+        c[var_y(i)] = -float(active.loc[i, objective_metric])
 
-    # Binary upper bounds
     ub = np.ones(total_vars)
     lb = np.zeros(total_vars)
 
-    # Force x[i, s] = 0 if not eligible
+    # Ineligible slots fixed to 0
     for i in range(n_players):
         for s in range(n_slots):
             if E[i, s] == 0:
                 ub[var_x(i, s)] = 0
 
-    # Locked players: force y[i] = 1
+    # Locked players fixed to 1
     for lock in (locks or []):
         lock_idx = active[active["Name"] == lock].index
         if len(lock_idx) > 0:
             lb[var_y(lock_idx[0])] = 1
 
-    # Base constraints
     rows, lower, upper = [], [], []
 
     # 1. Exactly 1 player per slot
@@ -277,7 +306,7 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
         lower.append(1.0)
         upper.append(1.0)
 
-    # 2. Linking: sum_s x[i, s] - y[i] = 0
+    # 2. Linking slot to player
     for i in range(n_players):
         row = np.zeros(total_vars)
         for s in range(n_slots):
@@ -287,7 +316,7 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
         lower.append(0.0)
         upper.append(0.0)
 
-    # 3. Salary cap: sum_i Salary[i] * y[i] <= cap
+    # 3. Salary cap
     row = np.zeros(total_vars)
     for i in range(n_players):
         row[var_y(i)] = int(active.loc[i, "Salary"])
@@ -322,7 +351,7 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
     lower.append(2.0)
     upper.append(np.inf)
 
-    # 6. Target game stack
+    # 6. Target game stack with bring-back
     if target_stack and target_stack != "None":
         stk_rows = active[active["Game Info"].str.contains(target_stack, case=False, na=False)]
         if len(stk_rows) >= stack_size:
@@ -344,7 +373,6 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
                     lower.append(1.0)
                     upper.append(np.inf)
 
-    # Iterative solving for 5 distinct lineups
     num_lineups = 5
     max_appearances = max(1, int(round(num_lineups * max_exposure)))
     player_usage_count = np.zeros(n_players, dtype=int)
@@ -357,12 +385,10 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
         iter_upper = list(upper)
         current_ub = np.array(ub)
 
-        # Exposure constraints
         for i in range(n_players):
             if player_usage_count[i] >= max_appearances and active.loc[i, "Name"] not in (locks or []):
                 current_ub[var_y(i)] = 0
 
-        # Max overlap constraint (differs by >= 2 players)
         for prev_y in history_rows:
             row = np.zeros(total_vars)
             for i in prev_y:
@@ -374,7 +400,7 @@ def optimize_5_lineups_scipy(pool_df, locks=None, excludes=None, cap=50000, max_
         A = np.array(iter_rows)
         constraints = LinearConstraint(A, iter_lower, iter_upper)
         bounds = Bounds(lb, current_ub)
-        integrality = np.ones(total_vars) # 1 = Integer/Binary
+        integrality = np.ones(total_vars)
 
         res = milp(c=c, constraints=constraints, bounds=bounds, integrality=integrality)
 
@@ -454,10 +480,23 @@ st.sidebar.header("2. Injury Status (Scratches)")
 all_names = sorted(merged_df["Name"].unique().tolist())
 outs = st.sidebar.multiselect("Mark OUT (Reallocates Usage/Minutes)", options=all_names)
 
+# Recalculate projections & parametric ceilings
 pool_df = reallocate_vacated_usage(merged_df, outs)
+pool_df = calculate_percentile_ceilings(pool_df)
 
 # Sidebar: Tournament Controls
 st.sidebar.header("3. GPP & Portfolio Controls")
+
+target_metric = st.sidebar.selectbox(
+    "Optimization Objective",
+    options=["Ceiling_90", "Ceiling_75", "Projected_FPTS"],
+    format_func=lambda x: {
+        "Ceiling_90": "🔥 90th Percentile (Max GPP Upside)",
+        "Ceiling_75": "🎯 75th Percentile (Balanced Tournament)",
+        "Projected_FPTS": "📊 Median / 50th Percentile (Cash/Floor)"
+    }[x]
+)
+
 locks = st.sidebar.multiselect("🔒 Lock Core Players", options=all_names)
 fades = st.sidebar.multiselect("❌ Exclude Players", options=[p for p in all_names if p not in locks])
 
@@ -484,7 +523,8 @@ with tab_lineups:
                 cap=salary_cap,
                 max_exposure=max_exp,
                 target_stack=game_stack,
-                stack_size=stack_players
+                stack_size=stack_players,
+                objective_metric=target_metric
             )
 
         if len(five_lineups) < 5:
@@ -493,9 +533,13 @@ with tab_lineups:
         if five_lineups:
             export_rows = []
             for idx, l_df in enumerate(five_lineups):
-                st.subheader(f"Lineup #{idx+1} — {l_df['Projected_FPTS'].sum().round(1)} Projected FPTS (${l_df['Salary'].sum():,} Salary)")
+                target_sum = l_df[target_metric].sum().round(1)
+                med_sum = l_df["Projected_FPTS"].sum().round(1)
+                sal_sum = l_df["Salary"].sum()
+                st.subheader(f"Lineup #{idx+1} — {target_sum} Target Pts (Median: {med_sum} pts | ${sal_sum:,} Salary)")
+                
                 st.dataframe(
-                    l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Projected_FPTS", "Value (x/1k)", "Game Info"]],
+                    l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]],
                     use_container_width=True,
                     hide_index=True
                 )
@@ -531,11 +575,11 @@ with tab_portfolio:
         exp_df.columns = ["Name", "Count"]
         exp_df["Exposure %"] = ((exp_df["Count"] / 5) * 100).round(1)
         
-        meta = pool_df[["Name", "TeamAbbrev", "Position", "Salary", "Projected_FPTS"]].drop_duplicates()
+        meta = pool_df[["Name", "TeamAbbrev", "Position", "Salary", "Projected_FPTS", "Ceiling_75", "Ceiling_90"]].drop_duplicates()
         portfolio_summary = pd.merge(exp_df, meta, on="Name", how="left")
         
         st.dataframe(
-            portfolio_summary[["Name", "TeamAbbrev", "Position", "Salary", "Count", "Exposure %", "Projected_FPTS"]],
+            portfolio_summary[["Name", "TeamAbbrev", "Position", "Salary", "Count", "Exposure %", "Projected_FPTS", "Ceiling_75", "Ceiling_90"]],
             use_container_width=True,
             hide_index=True
         )
@@ -545,8 +589,8 @@ with tab_portfolio:
 with tab_pool:
     st.subheader("Active Player Pool (Post Pace & Injury Adjustments)")
     st.dataframe(
-        pool_df[["Name", "Position", "TeamAbbrev", "Salary", "MIN", "Pace_Factor", "Projected_FPTS", "Value (x/1k)", "Game Info"]]
-        .sort_values(by="Projected_FPTS", ascending=False),
+        pool_df[["Name", "Position", "TeamAbbrev", "Salary", "MIN", "Pace_Factor", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]]
+        .sort_values(by=target_metric, ascending=False),
         use_container_width=True,
         hide_index=True
     )
