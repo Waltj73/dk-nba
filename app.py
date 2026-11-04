@@ -249,46 +249,59 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
     for l_idx in range(num_lineups):
         prob = pulp.LpProblem(f"DK_Lineup_{l_idx}", pulp.LpMaximize)
 
-        x = {}
-        for i in indices:
-            for s_idx, s in enumerate(slots):
-                if is_eligible(active.loc[i, "Position"], s):
-                    x[i, s] = pulp.LpVariable(f"x_{l_idx}_{i}_{s_idx}", cat="Binary")
-                else:
-                    x[i, s] = 0
+        # Use pulp.LpVariable.dicts to eliminate manual instance registration collisions
+        x = pulp.LpVariable.dicts(f"x_{l_idx}", (indices, slots), cat="Binary")
+        y = pulp.LpVariable.dicts(f"y_{l_idx}", indices, cat="Binary")
 
-        y = {i: pulp.LpVariable(f"y_{l_idx}_{i}", cat="Binary") for i in indices}
+        # Zero out ineligible slots
         for i in indices:
-            prob += pulp.lpSum(x[i, s] for s in slots) == y[i]
+            for s in slots:
+                if not is_eligible(active.loc[i, "Position"], s):
+                    prob += x[i][s] == 0
 
+        # Link player indicator to slot usage
+        for i in indices:
+            prob += pulp.lpSum(x[i][s] for s in slots) == y[i]
+
+        # Maximize total projected points
         prob += pulp.lpSum(float(active.loc[i, "Projected_FPTS"]) * y[i] for i in indices)
 
+        # 1 player per roster slot
         for s in slots:
-            prob += pulp.lpSum(x[i, s] for i in indices) == 1
+            prob += pulp.lpSum(x[i][s] for i in indices) == 1
+
+        # Max 1 selection per player
         for i in indices:
-            prob += pulp.lpSum(x[i, s] for s in slots) <= 1
+            prob += pulp.lpSum(x[i][s] for s in slots) <= 1
+
+        # Salary cap
         prob += pulp.lpSum(int(active.loc[i, "Salary"]) * y[i] for i in indices) <= cap
 
+        # Lock core players
         for lock in (locks or []):
             lock_idx = active[active["Name"] == lock].index
             if len(lock_idx) > 0:
                 prob += y[lock_idx[0]] == 1
 
+        # Max exposure cap across lineups
         for i in indices:
             if player_usage_count[i] >= max_appearances and active.loc[i, "Name"] not in (locks or []):
                 prob += y[i] == 0
 
+        # Overlap limit: Lineups must differ by at least 2 players
         for prev_y in lineup_history:
             prob += pulp.lpSum(y[i] for i in prev_y) <= 6
 
+        # Min 2 Games constraint
         games = [g for g in active["Game Info"].unique() if pd.notna(g)]
-        g_vars = {g: pulp.LpVariable(f"g_{l_idx}_{g_idx}", cat="Binary") for g_idx, g in enumerate(games)}
-        for g in games:
-            g_idx = active[active["Game Info"] == g].index
-            prob += pulp.lpSum(y[i] for i in g_idx) >= g_vars[g]
-            prob += pulp.lpSum(y[i] for i in g_idx) <= 8 * g_vars[g]
-        prob += pulp.lpSum(g_vars[g] for g in games) >= 2
+        g_vars = pulp.LpVariable.dicts(f"g_{l_idx}", range(len(games)), cat="Binary")
+        for g_idx, g in enumerate(games):
+            p_in_game = active[active["Game Info"] == g].index
+            prob += pulp.lpSum(y[i] for i in p_in_game) >= g_vars[g_idx]
+            prob += pulp.lpSum(y[i] for i in p_in_game) <= 8 * g_vars[g_idx]
+        prob += pulp.lpSum(g_vars[g_idx] for g_idx in range(len(games))) >= 2
 
+        # Optional Game Stacking with Bring-Back
         if target_stack and target_stack != "None":
             stk_rows = active[active["Game Info"].str.contains(target_stack, case=False, na=False)]
             if len(stk_rows) >= stack_size:
@@ -300,6 +313,7 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
                     prob += pulp.lpSum(y[i] for i in t1_idx) >= 1
                     prob += pulp.lpSum(y[i] for i in t2_idx) >= 1
 
+        # Solve
         solver = pulp.PULP_CBC_CMD(msg=False)
         prob.solve(solver)
 
@@ -314,7 +328,7 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
         roster_rows = []
         for s in slots:
             for i in indices:
-                val = pulp.value(x[i, s]) if not isinstance(x[i, s], (int, float)) else x[i, s]
+                val = pulp.value(x[i][s])
                 if val is not None and val > 0.5:
                     row = active.loc[i].to_dict()
                     row["Roster Slot"] = s
