@@ -237,7 +237,8 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
             return any(p in ["SF", "PF"] for p in pos)
         return slot in pos
 
-    indices = list(active.index)
+    n_players = len(active)
+    indices = list(range(n_players))
     num_lineups = 5
     max_appearances = max(1, int(round(num_lineups * max_exposure)))
     
@@ -246,27 +247,27 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
     generated_lineups = []
 
     for l_idx in range(num_lineups):
-        prob = pulp.LpProblem(f"DK_NBA_Opt_{l_idx}", pulp.LpMaximize)
+        prob = pulp.LpProblem(f"DK_Lineup_{l_idx}", pulp.LpMaximize)
 
         x = {}
         for i in indices:
-            for s in slots:
+            for s_idx, s in enumerate(slots):
                 if is_eligible(active.loc[i, "Position"], s):
-                    x[i, s] = pulp.LpVariable(f"x_{l_idx}_{i}_{s}", cat="Binary")
+                    x[i, s] = pulp.LpVariable(f"x_{l_idx}_{i}_{s_idx}", cat=pulp.LpBinary)
                 else:
                     x[i, s] = 0
 
-        y = {i: pulp.LpVariable(f"y_{l_idx}_{i}", cat="Binary") for i in indices}
+        y = {i: pulp.LpVariable(f"y_{l_idx}_{i}", cat=pulp.LpBinary) for i in indices}
         for i in indices:
             prob += pulp.lpSum(x[i, s] for s in slots) == y[i]
 
-        prob += pulp.lpSum(active.loc[i, "Projected_FPTS"] * y[i] for i in indices)
+        prob += pulp.lpSum(float(active.loc[i, "Projected_FPTS"]) * y[i] for i in indices)
 
         for s in slots:
             prob += pulp.lpSum(x[i, s] for i in indices) == 1
         for i in indices:
             prob += pulp.lpSum(x[i, s] for s in slots) <= 1
-        prob += pulp.lpSum(active.loc[i, "Salary"] * y[i] for i in indices) <= cap
+        prob += pulp.lpSum(int(active.loc[i, "Salary"]) * y[i] for i in indices) <= cap
 
         for lock in (locks or []):
             lock_idx = active[active["Name"] == lock].index
@@ -280,8 +281,8 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
         for prev_y in lineup_history:
             prob += pulp.lpSum(y[i] for i in prev_y) <= 6
 
-        games = active["Game Info"].unique()
-        g_vars = {g: pulp.LpVariable(f"g_{l_idx}_{g_i}", cat="Binary") for g_i, g in enumerate(games)}
+        games = [g for g in active["Game Info"].unique() if pd.notna(g)]
+        g_vars = {g: pulp.LpVariable(f"g_{l_idx}_{g_idx}", cat=pulp.LpBinary) for g_idx, g in enumerate(games)}
         for g in games:
             g_idx = active[active["Game Info"] == g].index
             prob += pulp.lpSum(y[i] for i in g_idx) >= g_vars[g]
@@ -305,7 +306,7 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
         if pulp.LpStatus[prob.status] != "Optimal":
             break
 
-        selected_indices = [i for i in indices if pulp.value(y[i]) > 0.5]
+        selected_indices = [i for i in indices if pulp.value(y[i]) is not None and pulp.value(y[i]) > 0.5]
         lineup_history.append(selected_indices)
         for i in selected_indices:
             player_usage_count[i] += 1
@@ -313,7 +314,7 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
         roster_rows = []
         for s in slots:
             for i in indices:
-                val = pulp.value(x[i, s])
+                val = pulp.value(x[i, s]) if not isinstance(x[i, s], (int, float)) else x[i, s]
                 if val is not None and val > 0.5:
                     row = active.loc[i].to_dict()
                     row["Roster Slot"] = s
