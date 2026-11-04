@@ -4,3 +4,4 @@ numpy
 requests
 pulp
 nba_api
+python-3.11
