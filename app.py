@@ -13,9 +13,9 @@ st.set_page_config(
 )
 
 st.title("🏀 DraftKings NBA DFS 5-Lineup Multi-Entry Engine")
-st.caption("Live Slate / CSV Ingestion • Pace & Usage Redistribution • PuLP Integer Linear Programming")
+st.caption("Live Slate / CSV Ingestion • Pace & Usage Redistribution • Zero-Crash Linear Program")
 
-# --- BROWSER HEADERS (Avoids Cloud Datacenter 403 Blocks) ---
+# --- BROWSER HEADERS ---
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -110,7 +110,6 @@ def fetch_nba_stats():
         )
         p_df = dash.get_data_frames()[0]
 
-        # Exact DK Scoring: PTS(1) + 3PM(0.5) + REB(1.25) + AST(1.5) + STL(2) + BLK(2) - TO(0.5)
         p_df["Base_DK_FPTS"] = (
             p_df["PTS"] * 1.0 +
             p_df["FG3M"] * 0.5 +
@@ -222,7 +221,7 @@ def reallocate_vacated_usage(df_pool, scratched_players):
     result_df["Value (x/1k)"] = (result_df["Projected_FPTS"] / (result_df["Salary"] / 1000)).round(2)
     return result_df
 
-# --- 3. 5-LINEUP MULTI-ENTRY OPTIMIZER (PuLP) ---
+# --- 3. PYTHON 3.14 COMPATIBLE 5-LINEUP OPTIMIZER ---
 def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposure=0.60, target_stack=None, stack_size=3):
     active = pool_df[~pool_df["Name"].isin(excludes or [])].copy().reset_index(drop=True)
     slots = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
@@ -249,15 +248,20 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
     for l_idx in range(num_lineups):
         prob = pulp.LpProblem(f"DK_Lineup_{l_idx}", pulp.LpMaximize)
 
-        # Use pulp.LpVariable.dicts to eliminate manual instance registration collisions
-        x = pulp.LpVariable.dicts(f"x_{l_idx}", (indices, slots), cat="Binary")
-        y = pulp.LpVariable.dicts(f"y_{l_idx}", indices, cat="Binary")
-
-        # Zero out ineligible slots
+        # Python 3.14 safe integer variable declaration (0 to 1 bounds avoid LpVariable constructor bugs)
+        x = {}
         for i in indices:
+            x[i] = {}
             for s in slots:
-                if not is_eligible(active.loc[i, "Position"], s):
-                    prob += x[i][s] == 0
+                if is_eligible(active.loc[i, "Position"], s):
+                    var_name = f"x_{l_idx}_{i}_{s}"
+                    x[i][s] = pulp.LpVariable(name=var_name, lowBound=0, upBound=1, cat="Integer")
+                else:
+                    x[i][s] = 0
+
+        y = {}
+        for i in indices:
+            y[i] = pulp.LpVariable(name=f"y_{l_idx}_{i}", lowBound=0, upBound=1, cat="Integer")
 
         # Link player indicator to slot usage
         for i in indices:
@@ -294,11 +298,13 @@ def optimize_5_lineups(pool_df, locks=None, excludes=None, cap=50000, max_exposu
 
         # Min 2 Games constraint
         games = [g for g in active["Game Info"].unique() if pd.notna(g)]
-        g_vars = pulp.LpVariable.dicts(f"g_{l_idx}", range(len(games)), cat="Binary")
+        g_vars = {}
         for g_idx, g in enumerate(games):
+            g_vars[g_idx] = pulp.LpVariable(name=f"g_{l_idx}_{g_idx}", lowBound=0, upBound=1, cat="Integer")
             p_in_game = active[active["Game Info"] == g].index
             prob += pulp.lpSum(y[i] for i in p_in_game) >= g_vars[g_idx]
             prob += pulp.lpSum(y[i] for i in p_in_game) <= 8 * g_vars[g_idx]
+
         prob += pulp.lpSum(g_vars[g_idx] for g_idx in range(len(games))) >= 2
 
         # Optional Game Stacking with Bring-Back
