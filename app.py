@@ -13,9 +13,8 @@ st.set_page_config(
 )
 
 st.title("🏀 DraftKings NBA DFS 5-Lineup Multi-Entry Engine")
-st.caption("Live Slate / CSV Ingestion • Pace & Usage Adjustments • 75th/90th Ceiling Modeling • SciPy MILP Solver")
+st.caption("Clean Game Matchups • Strict Minute Filters • Ceiling Optimization • SciPy MILP Solver")
 
-# --- BROWSER HEADERS (Avoids Cloud Datacenter 403 Blocks) ---
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -27,7 +26,6 @@ DK_HEADERS = {
 # --- 1. SLATE DATA FETCHERS & FALLBACK ---
 @st.cache_data(ttl=600)
 def fetch_dk_nba_contests():
-    """Scans DraftKings lobby for active NBA slates."""
     url = "https://www.draftkings.com/lobby/getcontests?sport=NBA"
     try:
         res = requests.get(url, headers=DK_HEADERS, timeout=8)
@@ -47,7 +45,6 @@ def fetch_dk_nba_contests():
 
 @st.cache_data(ttl=600)
 def fetch_dk_players_by_draftgroup(draft_group_id):
-    """Pulls full active player pool for a DraftGroup without crashing on 403/HTML."""
     if not draft_group_id:
         return pd.DataFrame()
     url = f"https://api.draftkings.com/draftgroups/v1/draftgroups/{draft_group_id}/draftables?format=json"
@@ -65,13 +62,19 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
             if p.get("isDisabled", False):
                 continue
             comp = p.get("competition", {})
-            game_desc = comp.get("name", "NBA Game")
+            game_desc = comp.get("name", "")
+            
+            # If DraftKings API doesn't populate competition name, construct it
+            team = p.get("teamAbbreviation", "")
+            if not game_desc:
+                game_desc = f"{team}_GAME"
+
             records.append({
                 "PlayerId": p.get("playerId"),
                 "Name": p.get("displayName"),
                 "Position": p.get("position", ""),
                 "Salary": int(p.get("salary", 0)),
-                "TeamAbbrev": p.get("teamAbbreviation", ""),
+                "TeamAbbrev": team,
                 "Game Info": game_desc
             })
         return pd.DataFrame(records).drop_duplicates(subset=["Name", "Position"])
@@ -79,7 +82,6 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
         return pd.DataFrame()
 
 def load_demo_slate():
-    """Fallback interactive demo slate when cloud host IP is blocked by DraftKings firewall."""
     return pd.DataFrame([
         {"Name": "Luka Doncic", "Position": "PG", "Salary": 11600, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "MIN": 37.2, "Base_Proj": 58.4},
         {"Name": "Nikola Jokic", "Position": "C", "Salary": 11400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 35.8, "Base_Proj": 60.1},
@@ -101,7 +103,6 @@ def load_demo_slate():
 # --- 2. NBA STATS & ADJUSTMENTS ---
 @st.cache_data(ttl=3600)
 def fetch_nba_stats():
-    """Pulls player averages & team pace from official NBA stats."""
     try:
         dash = leaguedashplayerstats.LeagueDashPlayerStats(
             per_mode_detailed='PerGame',
@@ -118,12 +119,7 @@ def fetch_nba_stats():
             p_df["BLK"] * 2.0 -
             p_df["TOV"] * 0.5
         )
-        p_df["DD_Bonus"] = (
-            ((p_df["PTS"] >= 10).astype(int) + 
-             (p_df["REB"] >= 10).astype(int) + 
-             (p_df["AST"] >= 10).astype(int)) >= 2
-        ).astype(int) * 1.5
-
+        p_df["DD_Bonus"] = (((p_df["PTS"] >= 10).astype(int) + (p_df["REB"] >= 10).astype(int) + (p_df["AST"] >= 10).astype(int)) >= 2).astype(int) * 1.5
         p_df["Season_FPTS"] = (p_df["Base_DK_FPTS"] + p_df["DD_Bonus"]).round(2)
         player_clean = p_df[["PLAYER_NAME", "MIN", "Season_FPTS"]].copy()
 
@@ -154,7 +150,6 @@ def fetch_nba_stats():
         return pd.DataFrame(), pd.DataFrame()
 
 def apply_pace_and_matchups(df, pace_df):
-    """Calculates Pace Multiplier based on expected possessions."""
     if pace_df.empty or "Game Info" not in df.columns:
         df["Pace_Factor"] = 1.0
         return df
@@ -180,7 +175,6 @@ def apply_pace_and_matchups(df, pace_df):
     return df
 
 def reallocate_vacated_usage(df_pool, scratched_players):
-    """Zeroes out scratched players and redistributes their minutes & usage to active teammates."""
     df = df_pool.copy()
     df["Is_Out"] = df["Name"].isin(scratched_players)
     df["USG%"] = np.clip(14.0 + (df["Salary"] - 3500) * (20.0 / 8500), 12.0, 36.0)
@@ -193,6 +187,7 @@ def reallocate_vacated_usage(df_pool, scratched_players):
 
         if outs.empty:
             actives["Projected_FPTS"] = (actives["Base_Proj"] * actives["Pace_Factor"]).round(2)
+            actives["Adj_MIN"] = actives["MIN"]
             adjusted.append(actives)
             continue
 
@@ -219,22 +214,17 @@ def reallocate_vacated_usage(df_pool, scratched_players):
     return result_df
 
 def calculate_percentile_ceilings(df):
-    """
-    Computes 75th and 90th percentile ceiling outcomes based on player usage and minutes volatility.
-    """
     df = df.copy()
-    # Volatility scales higher for lower-minute bench specialists than for core starters
-    min_factor = np.clip((36.0 - df["MIN"]) / 36.0, 0.0, 0.5)
-    cv = 0.20 + (min_factor * 0.15)  # CV: ~0.20 for 36m studs to ~0.35 for low-min punts
+    min_factor = np.clip((36.0 - df["Adj_MIN"]) / 36.0, 0.0, 0.5)
+    cv = 0.20 + (min_factor * 0.15)
 
     df["StdDev"] = (df["Projected_FPTS"] * cv).round(2)
-    # Parametric Gaussian percentiles (75th: z=0.674, 90th: z=1.282)
     df["Ceiling_75"] = (df["Projected_FPTS"] + 0.674 * df["StdDev"]).round(2)
     df["Ceiling_90"] = (df["Projected_FPTS"] + 1.282 * df["StdDev"]).round(2)
     df["Value (x/1k)"] = (df["Projected_FPTS"] / (df["Salary"] / 1000)).round(2)
     return df
 
-# --- 3. SCIPY MILP SOLVER (NATIVE C-HIGHS, NO PU-LP, NO SUBPROCESS) ---
+# --- 3. SCIPY MILP SOLVER ---
 def optimize_5_lineups_scipy(
     pool_df, 
     locks=None, 
@@ -243,7 +233,9 @@ def optimize_5_lineups_scipy(
     max_exposure=0.60, 
     target_stack=None, 
     stack_size=3,
-    objective_metric="Ceiling_90"
+    objective_metric="Ceiling_90",
+    min_studs=1,
+    min_stud_salary=9500
 ):
     active = pool_df[~pool_df["Name"].isin(excludes or [])].copy().reset_index(drop=True)
     slots = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
@@ -266,7 +258,7 @@ def optimize_5_lineups_scipy(
             if is_eligible(active.loc[i, "Position"], s):
                 E[i, s_idx] = 1
 
-    games = [g for g in active["Game Info"].unique() if pd.notna(g)]
+    games = [g for g in active["Game Info"].unique() if pd.notna(g) and "@" in str(g)]
     n_games = len(games)
 
     total_vars = (n_players * n_slots) + n_players + n_games
@@ -275,7 +267,6 @@ def optimize_5_lineups_scipy(
     def var_y(i): return (n_players * n_slots) + i
     def var_g(g_idx): return (n_players * n_slots) + n_players + g_idx
 
-    # Objective: Maximize chosen metric (negated for SciPy minimization)
     c = np.zeros(total_vars)
     for i in range(n_players):
         c[var_y(i)] = -float(active.loc[i, objective_metric])
@@ -283,13 +274,11 @@ def optimize_5_lineups_scipy(
     ub = np.ones(total_vars)
     lb = np.zeros(total_vars)
 
-    # Ineligible slots fixed to 0
     for i in range(n_players):
         for s in range(n_slots):
             if E[i, s] == 0:
                 ub[var_x(i, s)] = 0
 
-    # Locked players fixed to 1
     for lock in (locks or []):
         lock_idx = active[active["Name"] == lock].index
         if len(lock_idx) > 0:
@@ -324,35 +313,45 @@ def optimize_5_lineups_scipy(
     lower.append(0.0)
     upper.append(float(cap))
 
-    # 4. Unique game linking
-    for g_idx, g in enumerate(games):
-        p_indices = active[active["Game Info"] == g].index
-        row1 = np.zeros(total_vars)
-        for i in p_indices:
-            row1[var_y(i)] = 1
-        row1[var_g(g_idx)] = -1
-        rows.append(row1)
-        lower.append(0.0)
+    # 4. Enforce at least N Anchor Studs ($9,500+)
+    stud_indices = active[active["Salary"] >= min_stud_salary].index
+    if len(stud_indices) >= min_studs and min_studs > 0:
+        row = np.zeros(total_vars)
+        for i in stud_indices:
+            row[var_y(i)] = 1
+        rows.append(row)
+        lower.append(float(min_studs))
         upper.append(np.inf)
 
-        row2 = np.zeros(total_vars)
-        for i in p_indices:
-            row2[var_y(i)] = 1
-        row2[var_g(g_idx)] = -8
-        rows.append(row2)
-        lower.append(-np.inf)
-        upper.append(0.0)
+    # 5. Unique game linking
+    if n_games >= 2:
+        for g_idx, g in enumerate(games):
+            p_indices = active[active["Game Info"] == g].index
+            row1 = np.zeros(total_vars)
+            for i in p_indices:
+                row1[var_y(i)] = 1
+            row1[var_g(g_idx)] = -1
+            rows.append(row1)
+            lower.append(0.0)
+            upper.append(np.inf)
 
-    # 5. Min 2 games
-    row = np.zeros(total_vars)
-    for g_idx in range(n_games):
-        row[var_g(g_idx)] = 1
-    rows.append(row)
-    lower.append(2.0)
-    upper.append(np.inf)
+            row2 = np.zeros(total_vars)
+            for i in p_indices:
+                row2[var_y(i)] = 1
+            row2[var_g(g_idx)] = -8
+            rows.append(row2)
+            lower.append(-np.inf)
+            upper.append(0.0)
+
+        row = np.zeros(total_vars)
+        for g_idx in range(n_games):
+            row[var_g(g_idx)] = 1
+        rows.append(row)
+        lower.append(2.0)
+        upper.append(np.inf)
 
     # 6. Target game stack with bring-back
-    if target_stack and target_stack != "None":
+    if target_stack and target_stack != "None" and "@" in str(target_stack):
         stk_rows = active[active["Game Info"].str.contains(target_stack, case=False, na=False)]
         if len(stk_rows) >= stack_size:
             row = np.zeros(total_vars)
@@ -432,11 +431,18 @@ def optimize_5_lineups_scipy(
 
 # --- 4. SIDEBAR & INTERFACE ---
 st.sidebar.header("1. Slate Data Ingestion")
-data_mode = st.sidebar.radio("Data Ingestion Mode", ["Live DraftKings API", "Upload DKSalaries.csv"])
+data_mode = st.sidebar.radio("Data Ingestion Mode", ["Upload DKSalaries.csv", "Live DraftKings API"])
 
 slate_df = pd.DataFrame()
 
-if data_mode == "Live DraftKings API":
+if data_mode == "Upload DKSalaries.csv":
+    uploaded_file = st.sidebar.file_uploader("Upload DKSalaries.csv", type=["csv"])
+    if uploaded_file is not None:
+        slate_df = pd.read_csv(uploaded_file)
+        if "Game Info" not in slate_df.columns:
+            slate_df["Game Info"] = "NBA Game"
+
+elif data_mode == "Live DraftKings API":
     active_slates = fetch_dk_nba_contests()
     if active_slates:
         selected_dg = st.sidebar.selectbox("Active Slates", options=list(active_slates.keys()), format_func=lambda x: active_slates[x])
@@ -445,15 +451,8 @@ if data_mode == "Live DraftKings API":
     else:
         st.sidebar.warning("⚠️ Live API restricted by host IP. Upload DKSalaries.csv or use demo slate.")
 
-elif data_mode == "Upload DKSalaries.csv":
-    uploaded_file = st.sidebar.file_uploader("Upload DKSalaries.csv", type=["csv"])
-    if uploaded_file is not None:
-        slate_df = pd.read_csv(uploaded_file)
-        if "Game Info" not in slate_df.columns:
-            slate_df["Game Info"] = "NBA Game"
-
 if slate_df.empty:
-    st.info("💡 Live DraftKings API is blocked or no slate was found. Loaded interactive demo slate. Upload `DKSalaries.csv` in the sidebar to run today's live contests.")
+    st.info("💡 Upload your slate `DKSalaries.csv` in the sidebar to run live contests.")
     slate_df = load_demo_slate()
 
 salary_cap = st.sidebar.number_input("Salary Cap ($)", value=50000, step=500)
@@ -463,15 +462,15 @@ with st.spinner("Calculating projections & pace metrics..."):
 
 if not nba_player_stats.empty:
     merged_df = pd.merge(slate_df, nba_player_stats, left_on="Name", right_on="PLAYER_NAME", how="left")
-    merged_df["MIN"] = merged_df["MIN"].fillna(20.0).round(1)
+    merged_df["MIN"] = merged_df["MIN"].fillna(0.0).round(1)
     if "Base_Proj" not in merged_df.columns:
-        merged_df["Base_Proj"] = merged_df["Season_FPTS"].fillna(merged_df["Salary"] / 240.0).round(2)
+        merged_df["Base_Proj"] = merged_df["Season_FPTS"].fillna(0.0).round(2)
 else:
     merged_df = slate_df.copy()
     if "MIN" not in merged_df.columns:
-        merged_df["MIN"] = 24.0
+        merged_df["MIN"] = 0.0
     if "Base_Proj" not in merged_df.columns:
-        merged_df["Base_Proj"] = (merged_df["Salary"] / 220.0).round(2)
+        merged_df["Base_Proj"] = 0.0
 
 merged_df = apply_pace_and_matchups(merged_df, team_pace_stats)
 
@@ -482,10 +481,16 @@ outs = st.sidebar.multiselect("Mark OUT (Reallocates Usage/Minutes)", options=al
 
 # Recalculate projections & parametric ceilings
 pool_df = reallocate_vacated_usage(merged_df, outs)
+
+# Minimum Minutes Filter (filters out 0-minute garbage time punts)
+st.sidebar.header("3. Quality & Minutes Filters")
+min_proj_minutes = st.sidebar.slider("Min Expected Minutes", min_value=0.0, max_value=25.0, value=15.0, step=1.0)
+pool_df = pool_df[pool_df["Adj_MIN"] >= min_proj_minutes].copy()
+
 pool_df = calculate_percentile_ceilings(pool_df)
 
 # Sidebar: Tournament Controls
-st.sidebar.header("3. GPP & Portfolio Controls")
+st.sidebar.header("4. GPP & Portfolio Controls")
 
 target_metric = st.sidebar.selectbox(
     "Optimization Objective",
@@ -497,8 +502,10 @@ target_metric = st.sidebar.selectbox(
     }[x]
 )
 
-locks = st.sidebar.multiselect("🔒 Lock Core Players", options=all_names)
-fades = st.sidebar.multiselect("❌ Exclude Players", options=[p for p in all_names if p not in locks])
+min_studs_req = st.sidebar.number_input("Min Studs ($9,500+ Cap Anchors)", min_value=0, max_value=3, value=1)
+
+locks = st.sidebar.multiselect("🔒 Lock Core Players", options=sorted(pool_df["Name"].unique()))
+fades = st.sidebar.multiselect("❌ Exclude Players", options=[p for p in sorted(pool_df["Name"].unique()) if p not in locks])
 
 max_exp = st.sidebar.slider(
     "Max Player Exposure across 5 Lineups",
@@ -506,7 +513,8 @@ max_exp = st.sidebar.slider(
     help="0.60 means a player can appear in at most 3 of the 5 lineups."
 )
 
-slate_games = ["None"] + [g for g in pool_df["Game Info"].unique() if "@" in str(g)]
+valid_games = [g for g in pool_df["Game Info"].unique() if "@" in str(g)]
+slate_games = ["None"] + valid_games
 game_stack = st.sidebar.selectbox("🎯 Target Game Stack", options=slate_games)
 stack_players = st.sidebar.slider("Min Players from Stacked Game", 2, 4, 3)
 
@@ -524,11 +532,12 @@ with tab_lineups:
                 max_exposure=max_exp,
                 target_stack=game_stack,
                 stack_size=stack_players,
-                objective_metric=target_metric
+                objective_metric=target_metric,
+                min_studs=min_studs_req
             )
 
         if len(five_lineups) < 5:
-            st.warning(f"Solver generated {len(five_lineups)} valid lineups before running out of valid combinations. Try raising the maximum exposure limit or reducing player locks.")
+            st.warning(f"Solver generated {len(five_lineups)} valid lineups before running out of valid combinations. Try lowering the minimum expected minutes, reducing stud requirements, or relaxing exposure limits.")
 
         if five_lineups:
             export_rows = []
@@ -539,7 +548,7 @@ with tab_lineups:
                 st.subheader(f"Lineup #{idx+1} — {target_sum} Target Pts (Median: {med_sum} pts | ${sal_sum:,} Salary)")
                 
                 st.dataframe(
-                    l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]],
+                    l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]],
                     use_container_width=True,
                     hide_index=True
                 )
@@ -589,7 +598,7 @@ with tab_portfolio:
 with tab_pool:
     st.subheader("Active Player Pool (Post Pace & Injury Adjustments)")
     st.dataframe(
-        pool_df[["Name", "Position", "TeamAbbrev", "Salary", "MIN", "Pace_Factor", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]]
+        pool_df[["Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Pace_Factor", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]]
         .sort_values(by=target_metric, ascending=False),
         use_container_width=True,
         hide_index=True
