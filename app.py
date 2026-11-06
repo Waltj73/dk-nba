@@ -3,6 +3,7 @@ import pandas as pd
 import numpy as np
 import requests
 import io
+import re
 from scipy.optimize import milp, LinearConstraint, Bounds
 from nba_api.stats.endpoints import leaguedashplayerstats, leaguedashteamstats
 
@@ -13,7 +14,7 @@ st.set_page_config(
 )
 
 st.title("🏀 DraftKings NBA DFS 5-Lineup Multi-Entry Engine")
-st.caption("Auto-Detect CSV Scratches • Minutes & Usage Redistribution • SciPy MILP Tournament Optimizer")
+st.caption("Consensus Daily Projections • Minutes & Usage Redistribution • 75th/90th Ceiling • SciPy MILP")
 
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -94,14 +95,54 @@ def load_demo_slate():
         {"Name": "Jamal Murray", "Position": "PG", "Salary": 7600, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 33.0, "Base_Proj": 37.0},
         {"Name": "Jalen Williams", "Position": "SG/SF", "Salary": 7200, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 32.5, "Base_Proj": 36.2},
         {"Name": "Austin Reaves", "Position": "PG/SG", "Salary": 6200, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 31.4, "Base_Proj": 31.0},
-        {"Name": "Aaron Gordon", "Position": "PF", "Salary": 5800, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 30.5, "Base_Proj": 29.5},
+        {"Name": "Aaron Gordon", "Position": "PF", "Salary": 5800, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 30.5, "Base_Proj": 29.5},
         {"Name": "P.J. Washington", "Position": "SF/PF", "Salary": 5200, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 28.0, "Base_Proj": 26.0},
         {"Name": "Dereck Lively II", "Position": "C", "Salary": 4800, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 24.5, "Base_Proj": 25.0},
         {"Name": "Christian Braun", "Position": "SG", "Salary": 4400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 26.0, "Base_Proj": 22.0},
         {"Name": "Cason Wallace", "Position": "PG/SG", "Salary": 3800, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 20.0, "Base_Proj": 18.0},
     ])
 
-# --- 2. NBA STATS & ADJUSTMENTS ---
+# --- 2. OPEN-SOURCE CONSENSUS PROJECTIONS ---
+@st.cache_data(ttl=900)
+def fetch_open_source_projections():
+    """Pulls open daily fantasy projections and minutes from Daily Fantasy Fuel."""
+    url = "https://www.dailyfantasyfuel.com/nba/projections/draftkings"
+    headers = {
+        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Accept": "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8"
+    }
+    try:
+        res = requests.get(url, headers=headers, timeout=10)
+        if res.status_code != 200:
+            return pd.DataFrame()
+        tables = pd.read_html(io.StringIO(res.text))
+        if not tables:
+            return pd.DataFrame()
+
+        proj_df = tables[0]
+        # Rename standard columns
+        for col in proj_df.columns:
+            c_low = str(col).lower()
+            if "player" in c_low or "name" in c_low:
+                proj_df = proj_df.rename(columns={col: "Name"})
+            elif "min" in c_low:
+                proj_df = proj_df.rename(columns={col: "Open_MIN"})
+            elif "proj" in c_low or "fpts" in c_low or "pts" in c_low:
+                proj_df = proj_df.rename(columns={col: "Open_Proj_FPTS"})
+
+        if "Name" not in proj_df.columns or "Open_Proj_FPTS" not in proj_df.columns:
+            return pd.DataFrame()
+
+        # Clean names
+        proj_df["Name"] = proj_df["Name"].astype(str).str.replace(r"[^a-zA-Z\s\.\']", "", regex=True).str.strip()
+        proj_df["Open_MIN"] = pd.to_numeric(proj_df.get("Open_MIN", 0.0), errors="coerce").fillna(0.0)
+        proj_df["Open_Proj_FPTS"] = pd.to_numeric(proj_df["Open_Proj_FPTS"], errors="coerce").fillna(0.0)
+
+        return proj_df[["Name", "Open_MIN", "Open_Proj_FPTS"]].drop_duplicates(subset=["Name"])
+    except Exception:
+        return pd.DataFrame()
+
+# --- 3. NBA STATS & ADJUSTMENTS ---
 @st.cache_data(ttl=3600)
 def fetch_nba_stats():
     try:
@@ -225,7 +266,7 @@ def calculate_percentile_ceilings(df):
     df["Value (x/1k)"] = (df["Projected_FPTS"] / (df["Salary"] / 1000)).round(2)
     return df
 
-# --- 3. SCIPY MILP SOLVER ---
+# --- 4. SCIPY MILP SOLVER ---
 def optimize_5_lineups_scipy(
     pool_df, 
     locks=None, 
@@ -430,7 +471,7 @@ def optimize_5_lineups_scipy(
 
     return generated_lineups
 
-# --- 4. SIDEBAR & INTERFACE ---
+# --- 5. SIDEBAR & INTERFACE ---
 st.sidebar.header("1. Slate Data Ingestion")
 data_mode = st.sidebar.radio("Data Ingestion Mode", ["Upload DKSalaries.csv", "Live DraftKings API"])
 
@@ -458,20 +499,32 @@ if slate_df.empty:
 
 salary_cap = st.sidebar.number_input("Salary Cap ($)", value=50000, step=500)
 
-with st.spinner("Calculating projections & pace metrics..."):
+with st.spinner("Calculating consensus projections, pace & metrics..."):
     nba_player_stats, team_pace_stats = fetch_nba_stats()
+    open_proj_df = fetch_open_source_projections()
 
+# Merge DK Slate with official NBA Stats
 if not nba_player_stats.empty:
     merged_df = pd.merge(slate_df, nba_player_stats, left_on="Name", right_on="PLAYER_NAME", how="left")
-    merged_df["MIN"] = merged_df["MIN"].fillna(0.0).round(1)
-    if "Base_Proj" not in merged_df.columns:
-        merged_df["Base_Proj"] = merged_df["Season_FPTS"].fillna(0.0).round(2)
 else:
     merged_df = slate_df.copy()
-    if "MIN" not in merged_df.columns:
-        merged_df["MIN"] = 0.0
-    if "Base_Proj" not in merged_df.columns:
-        merged_df["Base_Proj"] = 0.0
+    merged_df["MIN"] = 0.0
+    merged_df["Season_FPTS"] = 0.0
+
+# Merge with Live Open Source Daily Projections
+if not open_proj_df.empty:
+    merged_df = pd.merge(merged_df, open_proj_df, on="Name", how="left")
+    merged_df["MIN"] = merged_df["Open_MIN"].fillna(merged_df.get("MIN", 0.0)).fillna(0.0).round(1)
+
+    has_open = merged_df["Open_Proj_FPTS"].notna() & (merged_df["Open_Proj_FPTS"] > 0)
+    merged_df["Base_Proj"] = np.where(
+        has_open,
+        (merged_df["Open_Proj_FPTS"] * 0.65) + (merged_df["Season_FPTS"].replace(0, np.nan).fillna(merged_df["Open_Proj_FPTS"]) * 0.35),
+        merged_df["Season_FPTS"].replace(0, np.nan).fillna(merged_df["Salary"] / 240.0)
+    ).round(2)
+else:
+    merged_df["MIN"] = merged_df.get("MIN", 0.0).fillna(0.0).round(1)
+    merged_df["Base_Proj"] = merged_df.get("Season_FPTS", 0.0).replace(0, np.nan).fillna(merged_df["Salary"] / 240.0).round(2)
 
 merged_df = apply_pace_and_matchups(merged_df, team_pace_stats)
 
@@ -479,7 +532,6 @@ merged_df = apply_pace_and_matchups(merged_df, team_pace_stats)
 st.sidebar.header("2. Injury Status (Scratches)")
 all_names = sorted(merged_df["Name"].unique().tolist())
 
-# Detect Out/IR/Suspended from DK CSV Instructions column
 auto_scratches = []
 if "Instructions" in merged_df.columns:
     detected = merged_df[
@@ -533,7 +585,7 @@ slate_games = ["None"] + valid_games
 game_stack = st.sidebar.selectbox("🎯 Target Game Stack", options=slate_games)
 stack_players = st.sidebar.slider("Min Players from Stacked Game", 2, 4, 3)
 
-# --- 5. TABS ---
+# --- 6. TABS ---
 tab_lineups, tab_portfolio, tab_pool = st.tabs(["⚡ 5 Optimized Lineups", "📊 Exposure Breakdown", "📋 Player Pool & Projections"])
 
 with tab_lineups:
@@ -611,7 +663,7 @@ with tab_portfolio:
         st.info("Click 'Generate 5 Tournament Lineups' in the first tab to view portfolio distribution.")
 
 with tab_pool:
-    st.subheader("Active Player Pool (Post Pace & Injury Adjustments)")
+    st.subheader("Active Player Pool (Consensus Blend, Pace & Ceiling Metrics)")
     st.dataframe(
         pool_df[["Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Pace_Factor", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]]
         .sort_values(by=target_metric, ascending=False),
