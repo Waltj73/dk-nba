@@ -13,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("🏀 DraftKings NBA DFS 5-Lineup Multi-Entry Engine")
-st.caption("Clean Game Matchups • Strict Minute Filters • Ceiling Optimization • SciPy MILP Solver")
+st.caption("Auto-Detect CSV Scratches • Minutes & Usage Redistribution • SciPy MILP Tournament Optimizer")
 
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -63,11 +63,11 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
                 continue
             comp = p.get("competition", {})
             game_desc = comp.get("name", "")
-            
-            # If DraftKings API doesn't populate competition name, construct it
             team = p.get("teamAbbreviation", "")
             if not game_desc:
                 game_desc = f"{team}_GAME"
+
+            status_inst = p.get("status", "")
 
             records.append({
                 "PlayerId": p.get("playerId"),
@@ -75,7 +75,8 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
                 "Position": p.get("position", ""),
                 "Salary": int(p.get("salary", 0)),
                 "TeamAbbrev": team,
-                "Game Info": game_desc
+                "Game Info": game_desc,
+                "Instructions": status_inst
             })
         return pd.DataFrame(records).drop_duplicates(subset=["Name", "Position"])
     except Exception:
@@ -83,21 +84,21 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
 
 def load_demo_slate():
     return pd.DataFrame([
-        {"Name": "Luka Doncic", "Position": "PG", "Salary": 11600, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "MIN": 37.2, "Base_Proj": 58.4},
-        {"Name": "Nikola Jokic", "Position": "C", "Salary": 11400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 35.8, "Base_Proj": 60.1},
-        {"Name": "Shai Gilgeous-Alexander", "Position": "PG", "Salary": 10400, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "MIN": 34.6, "Base_Proj": 53.2},
-        {"Name": "Anthony Davis", "Position": "PF/C", "Salary": 10100, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "MIN": 35.0, "Base_Proj": 51.5},
-        {"Name": "LeBron James", "Position": "SF/PF", "Salary": 9400, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "MIN": 34.2, "Base_Proj": 46.8},
-        {"Name": "Kyrie Irving", "Position": "PG/SG", "Salary": 8600, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "MIN": 34.0, "Base_Proj": 42.5},
-        {"Name": "Chet Holmgren", "Position": "PF/C", "Salary": 7900, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "MIN": 32.1, "Base_Proj": 39.0},
-        {"Name": "Jamal Murray", "Position": "PG", "Salary": 7600, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 33.0, "Base_Proj": 37.0},
-        {"Name": "Jalen Williams", "Position": "SG/SF", "Salary": 7200, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "MIN": 32.5, "Base_Proj": 36.2},
-        {"Name": "Austin Reaves", "Position": "PG/SG", "Salary": 6200, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "MIN": 31.4, "Base_Proj": 31.0},
-        {"Name": "Aaron Gordon", "Position": "PF", "Salary": 5800, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 30.5, "Base_Proj": 29.5},
-        {"Name": "P.J. Washington", "Position": "SF/PF", "Salary": 5200, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "MIN": 28.0, "Base_Proj": 26.0},
-        {"Name": "Dereck Lively II", "Position": "C", "Salary": 4800, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "MIN": 24.5, "Base_Proj": 25.0},
-        {"Name": "Christian Braun", "Position": "SG", "Salary": 4400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 26.0, "Base_Proj": 22.0},
-        {"Name": "Cason Wallace", "Position": "PG/SG", "Salary": 3800, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "MIN": 20.0, "Base_Proj": 18.0},
+        {"Name": "Luka Doncic", "Position": "PG", "Salary": 11600, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 37.2, "Base_Proj": 58.4},
+        {"Name": "Nikola Jokic", "Position": "C", "Salary": 11400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 35.8, "Base_Proj": 60.1},
+        {"Name": "Shai Gilgeous-Alexander", "Position": "PG", "Salary": 10400, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 34.6, "Base_Proj": 53.2},
+        {"Name": "Anthony Davis", "Position": "PF/C", "Salary": 10100, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 35.0, "Base_Proj": 51.5},
+        {"Name": "LeBron James", "Position": "SF/PF", "Salary": 9400, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 34.2, "Base_Proj": 46.8},
+        {"Name": "Kyrie Irving", "Position": "PG/SG", "Salary": 8600, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 34.0, "Base_Proj": 42.5},
+        {"Name": "Chet Holmgren", "Position": "PF/C", "Salary": 7900, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 32.1, "Base_Proj": 39.0},
+        {"Name": "Jamal Murray", "Position": "PG", "Salary": 7600, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 33.0, "Base_Proj": 37.0},
+        {"Name": "Jalen Williams", "Position": "SG/SF", "Salary": 7200, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 32.5, "Base_Proj": 36.2},
+        {"Name": "Austin Reaves", "Position": "PG/SG", "Salary": 6200, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 31.4, "Base_Proj": 31.0},
+        {"Name": "Aaron Gordon", "Position": "PF", "Salary": 5800, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 30.5, "Base_Proj": 29.5},
+        {"Name": "P.J. Washington", "Position": "SF/PF", "Salary": 5200, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 28.0, "Base_Proj": 26.0},
+        {"Name": "Dereck Lively II", "Position": "C", "Salary": 4800, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 24.5, "Base_Proj": 25.0},
+        {"Name": "Christian Braun", "Position": "SG", "Salary": 4400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 26.0, "Base_Proj": 22.0},
+        {"Name": "Cason Wallace", "Position": "PG/SG", "Salary": 3800, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 20.0, "Base_Proj": 18.0},
     ])
 
 # --- 2. NBA STATS & ADJUSTMENTS ---
@@ -313,7 +314,7 @@ def optimize_5_lineups_scipy(
     lower.append(0.0)
     upper.append(float(cap))
 
-    # 4. Enforce at least N Anchor Studs ($9,500+)
+    # 4. Enforce Anchor Studs ($9,500+)
     stud_indices = active[active["Salary"] >= min_stud_salary].index
     if len(stud_indices) >= min_studs and min_studs > 0:
         row = np.zeros(total_vars)
@@ -474,10 +475,23 @@ else:
 
 merged_df = apply_pace_and_matchups(merged_df, team_pace_stats)
 
-# Sidebar: Injury Scratches
+# Sidebar: Injury Scratches with CSV Auto-Detection
 st.sidebar.header("2. Injury Status (Scratches)")
 all_names = sorted(merged_df["Name"].unique().tolist())
-outs = st.sidebar.multiselect("Mark OUT (Reallocates Usage/Minutes)", options=all_names)
+
+# Detect Out/IR/Suspended from DK CSV Instructions column
+auto_scratches = []
+if "Instructions" in merged_df.columns:
+    detected = merged_df[
+        merged_df["Instructions"].astype(str).str.strip().str.upper().isin(["O", "OUT", "IR", "SUS"])
+    ]["Name"].tolist()
+    auto_scratches = [p for p in detected if p in all_names]
+
+outs = st.sidebar.multiselect(
+    "Mark OUT (Auto-detected from CSV + manual adds)",
+    options=all_names,
+    default=auto_scratches
+)
 
 # Recalculate projections & parametric ceilings
 pool_df = reallocate_vacated_usage(merged_df, outs)
@@ -504,8 +518,9 @@ target_metric = st.sidebar.selectbox(
 
 min_studs_req = st.sidebar.number_input("Min Studs ($9,500+ Cap Anchors)", min_value=0, max_value=3, value=1)
 
-locks = st.sidebar.multiselect("🔒 Lock Core Players", options=sorted(pool_df["Name"].unique()))
-fades = st.sidebar.multiselect("❌ Exclude Players", options=[p for p in sorted(pool_df["Name"].unique()) if p not in locks])
+available_active = sorted(pool_df["Name"].unique())
+locks = st.sidebar.multiselect("🔒 Lock Core Players", options=available_active)
+fades = st.sidebar.multiselect("❌ Exclude Players", options=[p for p in available_active if p not in locks])
 
 max_exp = st.sidebar.slider(
     "Max Player Exposure across 5 Lineups",
