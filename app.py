@@ -120,7 +120,6 @@ def fetch_open_source_projections():
             return pd.DataFrame()
 
         proj_df = tables[0]
-        # Rename standard columns
         for col in proj_df.columns:
             c_low = str(col).lower()
             if "player" in c_low or "name" in c_low:
@@ -133,10 +132,9 @@ def fetch_open_source_projections():
         if "Name" not in proj_df.columns or "Open_Proj_FPTS" not in proj_df.columns:
             return pd.DataFrame()
 
-        # Clean names
         proj_df["Name"] = proj_df["Name"].astype(str).str.replace(r"[^a-zA-Z\s\.\']", "", regex=True).str.strip()
         proj_df["Open_MIN"] = pd.to_numeric(proj_df.get("Open_MIN", 0.0), errors="coerce").fillna(0.0)
-        proj_df["Open_Proj_FPTS"] = pd.to_numeric(proj_df["Open_Proj_FPTS"], errors="coerce").fillna(0.0)
+        proj_df["Open_Proj_FPTS"] = pd.to_numeric(proj_df.get("Open_Proj_FPTS", 0.0), errors="coerce").fillna(0.0)
 
         return proj_df[["Name", "Open_MIN", "Open_Proj_FPTS"]].drop_duplicates(subset=["Name"])
     except Exception:
@@ -252,7 +250,13 @@ def reallocate_vacated_usage(df_pool, scratched_players):
         actives["Projected_FPTS"] = (actives["Adj_MIN"] * new_fppm * actives["Pace_Factor"]).round(2)
         adjusted.append(actives)
 
-    result_df = pd.concat(adjusted, ignore_index=True)
+    if adjusted:
+        result_df = pd.concat(adjusted, ignore_index=True)
+    else:
+        result_df = df.copy()
+        result_df["Adj_MIN"] = result_df["MIN"]
+        result_df["Projected_FPTS"] = result_df["Base_Proj"]
+        
     return result_df
 
 def calculate_percentile_ceilings(df):
@@ -283,6 +287,9 @@ def optimize_5_lineups_scipy(
     slots = ["PG", "SG", "SF", "PF", "C", "G", "F", "UTIL"]
     n_slots = len(slots)
     n_players = len(active)
+
+    if n_players < 8:
+        return []
 
     def is_eligible(pos_str, slot):
         pos = [p.strip() for p in str(pos_str).split("/")]
@@ -526,6 +533,10 @@ else:
     merged_df["MIN"] = merged_df.get("MIN", 0.0).fillna(0.0).round(1)
     merged_df["Base_Proj"] = merged_df.get("Season_FPTS", 0.0).replace(0, np.nan).fillna(merged_df["Salary"] / 240.0).round(2)
 
+# Dynamic baseline floor: Players priced >= $6,000 never have 0 minutes
+imputed_min = np.clip((merged_df["Salary"] - 3000) / 250.0, 12.0, 34.0)
+merged_df["MIN"] = np.where(merged_df["MIN"] > 0, merged_df["MIN"], imputed_min).round(1)
+
 merged_df = apply_pace_and_matchups(merged_df, team_pace_stats)
 
 # Sidebar: Injury Scratches with CSV Auto-Detection
@@ -550,8 +561,13 @@ pool_df = reallocate_vacated_usage(merged_df, outs)
 
 # Minimum Minutes Filter (filters out 0-minute garbage time punts)
 st.sidebar.header("3. Quality & Minutes Filters")
-min_proj_minutes = st.sidebar.slider("Min Expected Minutes", min_value=0.0, max_value=25.0, value=15.0, step=1.0)
+min_proj_minutes = st.sidebar.slider("Min Expected Minutes", min_value=0.0, max_value=25.0, value=12.0, step=1.0)
 pool_df = pool_df[pool_df["Adj_MIN"] >= min_proj_minutes].copy()
+
+# Guard: If filter removed too many players, preserve at least top 20 active players
+if len(pool_df) < 15:
+    st.sidebar.warning("⚠️ Min Expected Minutes filter is too strict. Showing top available players.")
+    pool_df = reallocate_vacated_usage(merged_df, outs).sort_values(by="Projected_FPTS", ascending=False).head(40)
 
 pool_df = calculate_percentile_ceilings(pool_df)
 
@@ -590,58 +606,61 @@ tab_lineups, tab_portfolio, tab_pool = st.tabs(["⚡ 5 Optimized Lineups", "📊
 
 with tab_lineups:
     if st.button("🚀 Generate 5 Tournament Lineups", type="primary"):
-        with st.spinner("Solving multi-lineup linear integer program with SciPy..."):
-            five_lineups = optimize_5_lineups_scipy(
-                pool_df=pool_df,
-                locks=locks,
-                excludes=fades,
-                cap=salary_cap,
-                max_exposure=max_exp,
-                target_stack=game_stack,
-                stack_size=stack_players,
-                objective_metric=target_metric,
-                min_studs=min_studs_req
-            )
-
-        if len(five_lineups) < 5:
-            st.warning(f"Solver generated {len(five_lineups)} valid lineups before running out of valid combinations. Try lowering the minimum expected minutes, reducing stud requirements, or relaxing exposure limits.")
-
-        if five_lineups:
-            export_rows = []
-            for idx, l_df in enumerate(five_lineups):
-                target_sum = l_df[target_metric].sum().round(1)
-                med_sum = l_df["Projected_FPTS"].sum().round(1)
-                sal_sum = l_df["Salary"].sum()
-                st.subheader(f"Lineup #{idx+1} — {target_sum} Target Pts (Median: {med_sum} pts | ${sal_sum:,} Salary)")
-                
-                st.dataframe(
-                    l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]],
-                    use_container_width=True,
-                    hide_index=True
+        if len(pool_df) < 8:
+            st.error("Player pool has fewer than 8 eligible players. Lower the 'Min Expected Minutes' slider in the sidebar.")
+        else:
+            with st.spinner("Solving multi-lineup linear integer program with SciPy..."):
+                five_lineups = optimize_5_lineups_scipy(
+                    pool_df=pool_df,
+                    locks=locks,
+                    excludes=fades,
+                    cap=salary_cap,
+                    max_exposure=max_exp,
+                    target_stack=game_stack,
+                    stack_size=stack_players,
+                    objective_metric=target_metric,
+                    min_studs=min_studs_req
                 )
-                
-                export_rows.append({
-                    "PG": l_df[l_df["Roster Slot"] == "PG"]["Name"].values[0],
-                    "SG": l_df[l_df["Roster Slot"] == "SG"]["Name"].values[0],
-                    "SF": l_df[l_df["Roster Slot"] == "SF"]["Name"].values[0],
-                    "PF": l_df[l_df["Roster Slot"] == "PF"]["Name"].values[0],
-                    "C": l_df[l_df["Roster Slot"] == "C"]["Name"].values[0],
-                    "G": l_df[l_df["Roster Slot"] == "G"]["Name"].values[0],
-                    "F": l_df[l_df["Roster Slot"] == "F"]["Name"].values[0],
-                    "UTIL": l_df[l_df["Roster Slot"] == "UTIL"]["Name"].values[0],
-                })
 
-            dk_export_df = pd.DataFrame(export_rows)
-            csv_buf = io.StringIO()
-            dk_export_df.to_csv(csv_buf, index=False)
-            st.download_button(
-                label="📥 Download 5-Lineup DraftKings CSV (Ready for Upload)",
-                data=csv_buf.getvalue(),
-                file_name="dk_5_lineup_entry.csv",
-                mime="text/csv"
-            )
+            if len(five_lineups) < 5:
+                st.warning(f"Solver generated {len(five_lineups)} valid lineups before running out of valid combinations. Try lowering the minimum expected minutes, reducing stud requirements, or relaxing exposure limits.")
 
-            st.session_state["five_lineups"] = five_lineups
+            if five_lineups:
+                export_rows = []
+                for idx, l_df in enumerate(five_lineups):
+                    target_sum = l_df[target_metric].sum().round(1)
+                    med_sum = l_df["Projected_FPTS"].sum().round(1)
+                    sal_sum = l_df["Salary"].sum()
+                    st.subheader(f"Lineup #{idx+1} — {target_sum} Target Pts (Median: {med_sum} pts | ${sal_sum:,} Salary)")
+                    
+                    st.dataframe(
+                        l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]],
+                        use_container_width=True,
+                        hide_index=True
+                    )
+                    
+                    export_rows.append({
+                        "PG": l_df[l_df["Roster Slot"] == "PG"]["Name"].values[0],
+                        "SG": l_df[l_df["Roster Slot"] == "SG"]["Name"].values[0],
+                        "SF": l_df[l_df["Roster Slot"] == "SF"]["Name"].values[0],
+                        "PF": l_df[l_df["Roster Slot"] == "PF"]["Name"].values[0],
+                        "C": l_df[l_df["Roster Slot"] == "C"]["Name"].values[0],
+                        "G": l_df[l_df["Roster Slot"] == "G"]["Name"].values[0],
+                        "F": l_df[l_df["Roster Slot"] == "F"]["Name"].values[0],
+                        "UTIL": l_df[l_df["Roster Slot"] == "UTIL"]["Name"].values[0],
+                    })
+
+                dk_export_df = pd.DataFrame(export_rows)
+                csv_buf = io.StringIO()
+                dk_export_df.to_csv(csv_buf, index=False)
+                st.download_button(
+                    label="📥 Download 5-Lineup DraftKings CSV (Ready for Upload)",
+                    data=csv_buf.getvalue(),
+                    file_name="dk_5_lineup_entry.csv",
+                    mime="text/csv"
+                )
+
+                st.session_state["five_lineups"] = five_lineups
 
 with tab_portfolio:
     st.subheader("Player Portfolio & Leverage Exposures")
