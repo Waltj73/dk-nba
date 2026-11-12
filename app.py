@@ -3,7 +3,6 @@ import pandas as pd
 import numpy as np
 import requests
 import io
-import re
 from scipy.optimize import milp, LinearConstraint, Bounds
 from nba_api.stats.endpoints import leaguedashplayerstats, leaguedashteamstats
 
@@ -14,7 +13,7 @@ st.set_page_config(
 )
 
 st.title("🏀 DraftKings NBA DFS 5-Lineup Multi-Entry Engine")
-st.caption("Consensus Daily Projections • Minutes & Usage Redistribution • 75th/90th Ceiling • SciPy MILP")
+st.caption("Vegas Implied Totals & Blowout Protection • Normalized Game Caps • 75th/90th Ceiling • SciPy MILP")
 
 DK_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -23,6 +22,40 @@ DK_HEADERS = {
     "Referer": "https://www.draftkings.com/",
     "Origin": "https://www.draftkings.com"
 }
+
+TEAM_NAME_TO_ABBREV = {
+    'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BKN',
+    'Charlotte Hornets': 'CHA', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE',
+    'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET',
+    'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND',
+    'LA Clippers': 'LAC', 'Los Angeles Clippers': 'LAC', 'Los Angeles Lakers': 'LAL',
+    'Memphis Grizzlies': 'MEM', 'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL',
+    'Minnesota Timberwolves': 'MIN', 'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK',
+    'Oklahoma City Thunder': 'OKC', 'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI',
+    'Phoenix Suns': 'PHX', 'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC',
+    'San Antonio Spurs': 'SAS', 'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA',
+    'Washington Wizards': 'WAS'
+}
+
+def normalize_team_abbrev(abbrev):
+    """Standardizes DK team codes (e.g., GS -> GSW, NO -> NOP, SA -> SAS, NY -> NYK, PHO -> PHX)."""
+    mapping = {
+        "GS": "GSW", "NO": "NOP", "NY": "NYK", "SA": "SAS",
+        "PHO": "PHX", "UTAH": "UTA", "WSH": "WAS", "BK": "BKN"
+    }
+    clean = str(abbrev).strip().upper()
+    return mapping.get(clean, clean)
+
+def clean_game_string(game_str):
+    """Strips DK timestamps so 'LAL@ATL 11/12/2026 07:30PM ET' becomes 'LAL@ATL'."""
+    raw = str(game_str).strip().split(" ")[0].upper()
+    if "@" in raw:
+        parts = raw.split("@")
+        if len(parts) == 2:
+            away = normalize_team_abbrev(parts[0])
+            home = normalize_team_abbrev(parts[1])
+            return f"{away}@{home}"
+    return raw
 
 # --- 1. SLATE DATA FETCHERS & FALLBACK ---
 @st.cache_data(ttl=600)
@@ -64,11 +97,9 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
                 continue
             comp = p.get("competition", {})
             game_desc = comp.get("name", "")
-            team = p.get("teamAbbreviation", "")
+            team = normalize_team_abbrev(p.get("teamAbbreviation", ""))
             if not game_desc:
                 game_desc = f"{team}_GAME"
-
-            status_inst = p.get("status", "")
 
             records.append({
                 "PlayerId": p.get("playerId"),
@@ -77,7 +108,7 @@ def fetch_dk_players_by_draftgroup(draft_group_id):
                 "Salary": int(p.get("salary", 0)),
                 "TeamAbbrev": team,
                 "Game Info": game_desc,
-                "Instructions": status_inst
+                "Instructions": p.get("status", "")
             })
         return pd.DataFrame(records).drop_duplicates(subset=["Name", "Position"])
     except Exception:
@@ -95,17 +126,57 @@ def load_demo_slate():
         {"Name": "Jamal Murray", "Position": "PG", "Salary": 7600, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 33.0, "Base_Proj": 37.0},
         {"Name": "Jalen Williams", "Position": "SG/SF", "Salary": 7200, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 32.5, "Base_Proj": 36.2},
         {"Name": "Austin Reaves", "Position": "PG/SG", "Salary": 6200, "TeamAbbrev": "LAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 31.4, "Base_Proj": 31.0},
-        {"Name": "Aaron Gordon", "Position": "PF", "Salary": 5800, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "MIN": 30.5, "Base_Proj": 29.5},
+        {"Name": "Aaron Gordon", "Position": "PF", "Salary": 5800, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 30.5, "Base_Proj": 29.5},
         {"Name": "P.J. Washington", "Position": "SF/PF", "Salary": 5200, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 28.0, "Base_Proj": 26.0},
         {"Name": "Dereck Lively II", "Position": "C", "Salary": 4800, "TeamAbbrev": "DAL", "Game Info": "DAL@LAL", "Instructions": "", "MIN": 24.5, "Base_Proj": 25.0},
         {"Name": "Christian Braun", "Position": "SG", "Salary": 4400, "TeamAbbrev": "DEN", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 26.0, "Base_Proj": 22.0},
         {"Name": "Cason Wallace", "Position": "PG/SG", "Salary": 3800, "TeamAbbrev": "OKC", "Game Info": "OKC@DEN", "Instructions": "", "MIN": 20.0, "Base_Proj": 18.0},
     ])
 
-# --- 2. OPEN-SOURCE CONSENSUS PROJECTIONS ---
+# --- 2. LIVE VEGAS ODDS FETCHER (THE ODDS API) ---
+@st.cache_data(ttl=900)
+def fetch_vegas_odds(api_key):
+    """Fetches live NBA spreads and game totals from The Odds API."""
+    if not api_key or not api_key.strip():
+        return {}
+    url = "https://api.the-odds-api.com/v4/sports/basketball_nba/odds"
+    params = {
+        "apiKey": api_key.strip(),
+        "regions": "us",
+        "markets": "spreads,totals",
+        "oddsFormat": "american"
+    }
+    try:
+        res = requests.get(url, params=params, timeout=10)
+        if res.status_code != 200:
+            return {}
+        data = res.json()
+        odds_map = {}
+        for event in data:
+            away_abbr = TEAM_NAME_TO_ABBREV.get(event.get("away_team"))
+            home_abbr = TEAM_NAME_TO_ABBREV.get(event.get("home_team"))
+            if not away_abbr or not home_abbr:
+                continue
+            game_key = f"{away_abbr}@{home_abbr}"
+            total_val = 228.0
+            home_spread = 0.0
+            bookmakers = event.get("bookmakers", [])
+            if bookmakers:
+                for mkt in bookmakers[0].get("markets", []):
+                    if mkt["key"] == "totals" and mkt.get("outcomes"):
+                        total_val = float(mkt["outcomes"][0].get("point", 228.0))
+                    elif mkt["key"] == "spreads":
+                        for out in mkt.get("outcomes", []):
+                            if out.get("name") == event.get("home_team"):
+                                home_spread = float(out.get("point", 0.0))
+            odds_map[game_key] = {"Total": total_val, "Home_Spread": home_spread}
+        return odds_map
+    except Exception:
+        return {}
+
+# --- 3. OPEN-SOURCE CONSENSUS PROJECTIONS ---
 @st.cache_data(ttl=900)
 def fetch_open_source_projections():
-    """Pulls open daily fantasy projections and minutes from Daily Fantasy Fuel."""
     url = "https://www.dailyfantasyfuel.com/nba/projections/draftkings"
     headers = {
         "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
@@ -140,78 +211,106 @@ def fetch_open_source_projections():
     except Exception:
         return pd.DataFrame()
 
-# --- 3. NBA STATS & ADJUSTMENTS ---
+# --- 4. NBA STATS & VEGAS/PACE ADJUSTMENTS ---
 @st.cache_data(ttl=3600)
 def fetch_nba_stats():
-    try:
-        dash = leaguedashplayerstats.LeagueDashPlayerStats(
-            per_mode_detailed='PerGame',
-            season='2025-26',
-            season_type_all_star='Regular Season'
-        )
-        p_df = dash.get_data_frames()[0]
-        p_df["Base_DK_FPTS"] = (
-            p_df["PTS"] * 1.0 +
-            p_df["FG3M"] * 0.5 +
-            p_df["REB"] * 1.25 +
-            p_df["AST"] * 1.5 +
-            p_df["STL"] * 2.0 +
-            p_df["BLK"] * 2.0 -
-            p_df["TOV"] * 0.5
-        )
-        p_df["DD_Bonus"] = (((p_df["PTS"] >= 10).astype(int) + (p_df["REB"] >= 10).astype(int) + (p_df["AST"] >= 10).astype(int)) >= 2).astype(int) * 1.5
-        p_df["Season_FPTS"] = (p_df["Base_DK_FPTS"] + p_df["DD_Bonus"]).round(2)
-        player_clean = p_df[["PLAYER_NAME", "MIN", "Season_FPTS"]].copy()
+    for season_str in ["2026-27", "2025-26"]:
+        try:
+            dash = leaguedashplayerstats.LeagueDashPlayerStats(
+                per_mode_detailed='PerGame',
+                season=season_str,
+                season_type_all_star='Regular Season'
+            )
+            p_df = dash.get_data_frames()[0]
+            if p_df.empty:
+                continue
 
-        t_dash = leaguedashteamstats.LeagueDashTeamStats(
-            measure_type_detailed_defense='Advanced',
-            per_mode_detailed='PerGame',
-            season='2025-26',
-            season_type_all_star='Regular Season'
-        )
-        t_df = t_dash.get_data_frames()[0]
-        team_map = {
-            'Atlanta Hawks': 'ATL', 'Boston Celtics': 'BOS', 'Brooklyn Nets': 'BKN',
-            'Charlotte Hornets': 'CHA', 'Chicago Bulls': 'CHI', 'Cleveland Cavaliers': 'CLE',
-            'Dallas Mavericks': 'DAL', 'Denver Nuggets': 'DEN', 'Detroit Pistons': 'DET',
-            'Golden State Warriors': 'GSW', 'Houston Rockets': 'HOU', 'Indiana Pacers': 'IND',
-            'LA Clippers': 'LAC', 'Los Angeles Lakers': 'LAL', 'Memphis Grizzlies': 'MEM',
-            'Miami Heat': 'MIA', 'Milwaukee Bucks': 'MIL', 'Minnesota Timberwolves': 'MIN',
-            'New Orleans Pelicans': 'NOP', 'New York Knicks': 'NYK', 'Oklahoma City Thunder': 'OKC',
-            'Orlando Magic': 'ORL', 'Philadelphia 76ers': 'PHI', 'Phoenix Suns': 'PHX',
-            'Portland Trail Blazers': 'POR', 'Sacramento Kings': 'SAC', 'San Antonio Spurs': 'SAS',
-            'Toronto Raptors': 'TOR', 'Utah Jazz': 'UTA', 'Washington Wizards': 'WAS'
-        }
-        t_df["TeamAbbrev"] = t_df["TEAM_NAME"].map(team_map)
-        team_clean = t_df[["TeamAbbrev", "PACE"]].dropna()
+            p_df["Base_DK_FPTS"] = (
+                p_df["PTS"] * 1.0 +
+                p_df["FG3M"] * 0.5 +
+                p_df["REB"] * 1.25 +
+                p_df["AST"] * 1.5 +
+                p_df["STL"] * 2.0 +
+                p_df["BLK"] * 2.0 -
+                p_df["TOV"] * 0.5
+            )
+            p_df["DD_Bonus"] = (
+                ((p_df["PTS"] >= 10).astype(int) +
+                 (p_df["REB"] >= 10).astype(int) +
+                 (p_df["AST"] >= 10).astype(int)) >= 2
+            ).astype(int) * 1.5
+            p_df["Season_FPTS"] = (p_df["Base_DK_FPTS"] + p_df["DD_Bonus"]).round(2)
+            player_clean = p_df[["PLAYER_NAME", "MIN", "Season_FPTS"]].copy()
 
-        return player_clean, team_clean
-    except Exception:
-        return pd.DataFrame(), pd.DataFrame()
+            t_dash = leaguedashteamstats.LeagueDashTeamStats(
+                measure_type_detailed_defense='Advanced',
+                per_mode_detailed='PerGame',
+                season=season_str,
+                season_type_all_star='Regular Season'
+            )
+            t_df = t_dash.get_data_frames()[0]
+            t_df["TeamAbbrev"] = t_df["TEAM_NAME"].map(TEAM_NAME_TO_ABBREV)
+            team_clean = t_df[["TeamAbbrev", "PACE"]].dropna()
 
-def apply_pace_and_matchups(df, pace_df):
-    if pace_df.empty or "Game Info" not in df.columns:
-        df["Pace_Factor"] = 1.0
-        return df
+            return player_clean, team_clean
+        except Exception:
+            continue
+    return pd.DataFrame(), pd.DataFrame()
+
+def apply_vegas_and_pace(df, pace_df, vegas_df, blowout_spread=11.5, blowout_discount=0.09):
+    """Applies team pace, Vegas Implied Team Totals (ITT), and stud blowout haircuts."""
+    df = df.copy()
 
     def extract_opp(row):
-        game = str(row["Game Info"]).split(" ")[0]
+        game = str(row["Clean_Game"])
         if "@" in game:
             away, home = game.split("@")
             return home if row["TeamAbbrev"] == away else away
         return None
 
     df["Opponent"] = df.apply(extract_opp, axis=1)
-    league_pace = pace_df["PACE"].mean()
-    pace_map = pace_df.set_index("TeamAbbrev")["PACE"].to_dict()
 
-    def calc_pace_mult(row):
-        t_pace = pace_map.get(row["TeamAbbrev"], league_pace)
-        o_pace = pace_map.get(row["Opponent"], league_pace)
-        expected_game_pace = (t_pace * o_pace) / league_pace
-        return round(expected_game_pace / t_pace, 3)
+    # 1. Pace Multiplier
+    if not pace_df.empty:
+        league_pace = pace_df["PACE"].mean()
+        pace_map = pace_df.set_index("TeamAbbrev")["PACE"].to_dict()
 
-    df["Pace_Factor"] = df.apply(calc_pace_mult, axis=1)
+        def calc_pace_mult(row):
+            t_pace = pace_map.get(row["TeamAbbrev"], league_pace)
+            o_pace = pace_map.get(row["Opponent"], league_pace)
+            expected_game_pace = (t_pace * o_pace) / league_pace
+            return round(expected_game_pace / t_pace, 3)
+
+        df["Pace_Factor"] = df.apply(calc_pace_mult, axis=1)
+    else:
+        df["Pace_Factor"] = 1.0
+
+    # 2. Vegas Implied Team Totals & Blowout Risk
+    vegas_lookup = {}
+    if not vegas_df.empty:
+        for _, vrow in vegas_df.iterrows():
+            g = vrow["Game"]
+            if "@" in g:
+                away, home = g.split("@")
+                tot = float(vrow["Total"])
+                h_sprd = float(vrow["Home_Spread"])
+                home_itt = (tot / 2.0) - (h_sprd / 2.0)
+                away_itt = (tot / 2.0) + (h_sprd / 2.0)
+                vegas_lookup[home] = {"ITT": round(home_itt, 1), "Abs_Spread": abs(h_sprd)}
+                vegas_lookup[away] = {"ITT": round(away_itt, 1), "Abs_Spread": abs(h_sprd)}
+
+    def calc_vegas_metrics(row):
+        info = vegas_lookup.get(row["TeamAbbrev"], {"ITT": 114.0, "Abs_Spread": 0.0})
+        itt = info["ITT"]
+        abs_spread = info["Abs_Spread"]
+        # Dampened 50% ITT scaling around 114.0 league baseline
+        itt_mult = 1.0 + ((itt - 114.0) / 114.0) * 0.50
+        # Blowout penalty for $9,000+ stars when spread >= threshold
+        b_mult = (1.0 - blowout_discount) if (abs_spread >= blowout_spread and row["Salary"] >= 9000) else 1.0
+        return pd.Series([itt, abs_spread, round(itt_mult * b_mult, 3)])
+
+    df[["Vegas_ITT", "Game_Spread", "Vegas_Factor"]] = df.apply(calc_vegas_metrics, axis=1)
+    df["Env_Mult"] = (df["Pace_Factor"] * df["Vegas_Factor"]).round(3)
     return df
 
 def reallocate_vacated_usage(df_pool, scratched_players):
@@ -226,7 +325,7 @@ def reallocate_vacated_usage(df_pool, scratched_players):
         actives = group[~group["Is_Out"]].copy()
 
         if outs.empty:
-            actives["Projected_FPTS"] = (actives["Base_Proj"] * actives["Pace_Factor"]).round(2)
+            actives["Projected_FPTS"] = (actives["Base_Proj"] * actives["Env_Mult"]).round(2)
             actives["Adj_MIN"] = actives["MIN"]
             adjusted.append(actives)
             continue
@@ -245,9 +344,9 @@ def reallocate_vacated_usage(df_pool, scratched_players):
         usg_weights = actives["USG%"] / actives["USG%"].sum()
         actives["Adj_USG%"] = (actives["USG%"] + (vacated_usg * 0.70 * usg_weights)).round(2)
         usg_lift = (actives["Adj_USG%"] - actives["USG%"]) / actives["USG%"]
-        
+
         new_fppm = actives["FPPM"] * (1.0 + (usg_lift * 0.75))
-        actives["Projected_FPTS"] = (actives["Adj_MIN"] * new_fppm * actives["Pace_Factor"]).round(2)
+        actives["Projected_FPTS"] = (actives["Adj_MIN"] * new_fppm * actives["Env_Mult"]).round(2)
         adjusted.append(actives)
 
     if adjusted:
@@ -256,7 +355,7 @@ def reallocate_vacated_usage(df_pool, scratched_players):
         result_df = df.copy()
         result_df["Adj_MIN"] = result_df["MIN"]
         result_df["Projected_FPTS"] = result_df["Base_Proj"]
-        
+
     return result_df
 
 def calculate_percentile_ceilings(df):
@@ -270,15 +369,16 @@ def calculate_percentile_ceilings(df):
     df["Value (x/1k)"] = (df["Projected_FPTS"] / (df["Salary"] / 1000)).round(2)
     return df
 
-# --- 4. SCIPY MILP SOLVER ---
+# --- 5. SCIPY MILP SOLVER ---
 def optimize_5_lineups_scipy(
-    pool_df, 
-    locks=None, 
-    excludes=None, 
-    cap=50000, 
-    max_exposure=0.60, 
-    target_stack=None, 
+    pool_df,
+    locks=None,
+    excludes=None,
+    cap=50000,
+    max_exposure=0.60,
+    target_stack=None,
     stack_size=3,
+    max_game_players=4,
     objective_metric="Ceiling_90",
     min_studs=1,
     min_stud_salary=9500
@@ -307,11 +407,11 @@ def optimize_5_lineups_scipy(
             if is_eligible(active.loc[i, "Position"], s):
                 E[i, s_idx] = 1
 
-    games = [g for g in active["Game Info"].unique() if pd.notna(g) and "@" in str(g)]
+    games = [g for g in active["Clean_Game"].unique() if "@" in str(g)]
     n_games = len(games)
 
     total_vars = (n_players * n_slots) + n_players + n_games
-    
+
     def var_x(i, s): return i * n_slots + s
     def var_y(i): return (n_players * n_slots) + i
     def var_g(g_idx): return (n_players * n_slots) + n_players + g_idx
@@ -372,10 +472,11 @@ def optimize_5_lineups_scipy(
         lower.append(float(min_studs))
         upper.append(np.inf)
 
-    # 5. Unique game linking
+    # 5. Unique game linking + Strict Anti-Cannibalization Game Cap
     if n_games >= 2:
         for g_idx, g in enumerate(games):
-            p_indices = active[active["Game Info"] == g].index
+            p_indices = active[active["Clean_Game"] == g].index
+
             row1 = np.zeros(total_vars)
             for i in p_indices:
                 row1[var_y(i)] = 1
@@ -392,6 +493,14 @@ def optimize_5_lineups_scipy(
             lower.append(-np.inf)
             upper.append(0.0)
 
+            # Hard Ceiling: Never allow more than max_game_players from one game
+            row_cap = np.zeros(total_vars)
+            for i in p_indices:
+                row_cap[var_y(i)] = 1
+            rows.append(row_cap)
+            lower.append(0.0)
+            upper.append(float(max_game_players))
+
         row = np.zeros(total_vars)
         for g_idx in range(n_games):
             row[var_g(g_idx)] = 1
@@ -401,13 +510,14 @@ def optimize_5_lineups_scipy(
 
     # 6. Target game stack with bring-back
     if target_stack and target_stack != "None" and "@" in str(target_stack):
-        stk_rows = active[active["Game Info"].str.contains(target_stack, case=False, na=False)]
-        if len(stk_rows) >= stack_size:
+        effective_stack = min(stack_size, max_game_players)
+        stk_rows = active[active["Clean_Game"] == target_stack]
+        if len(stk_rows) >= effective_stack:
             row = np.zeros(total_vars)
             for i in stk_rows.index:
                 row[var_y(i)] = 1
             rows.append(row)
-            lower.append(float(stack_size))
+            lower.append(float(effective_stack))
             upper.append(np.inf)
 
             teams = stk_rows["TeamAbbrev"].unique()
@@ -478,7 +588,7 @@ def optimize_5_lineups_scipy(
 
     return generated_lineups
 
-# --- 5. SIDEBAR & INTERFACE ---
+# --- 6. SIDEBAR & INTERFACE ---
 st.sidebar.header("1. Slate Data Ingestion")
 data_mode = st.sidebar.radio("Data Ingestion Mode", ["Upload DKSalaries.csv", "Live DraftKings API"])
 
@@ -504,13 +614,48 @@ if slate_df.empty:
     st.info("💡 Upload your slate `DKSalaries.csv` in the sidebar to run live contests.")
     slate_df = load_demo_slate()
 
+# Normalize team abbreviations and clean Game Info strings immediately
+slate_df["TeamAbbrev"] = slate_df["TeamAbbrev"].apply(normalize_team_abbrev)
+slate_df["Clean_Game"] = slate_df["Game Info"].apply(clean_game_string)
+
 salary_cap = st.sidebar.number_input("Salary Cap ($)", value=50000, step=500)
 
-with st.spinner("Calculating consensus projections, pace & metrics..."):
+# Sidebar: Vegas Odds & Blowout Protection
+st.sidebar.header("2. Vegas Odds & Blowout Filter")
+odds_api_key = st.sidebar.text_input("The Odds API Key (Optional)", type="password", help="Paste a free key from the-odds-api.com to auto-fill live spreads & totals.")
+live_odds = fetch_vegas_odds(odds_api_key)
+
+slate_matchups = sorted([g for g in slate_df["Clean_Game"].unique() if "@" in g])
+if not slate_matchups:
+    slate_matchups = ["DAL@LAL", "OKC@DEN"]
+
+default_vegas_rows = []
+for g in slate_matchups:
+    g_odds = live_odds.get(g, {"Total": 228.0, "Home_Spread": 0.0})
+    default_vegas_rows.append({
+        "Game": g,
+        "Total": float(g_odds["Total"]),
+        "Home_Spread": float(g_odds["Home_Spread"])
+    })
+
+st.sidebar.caption("Edit Totals & Home Spreads (- = Home Favored, + = Away Favored):")
+vegas_edited_df = st.sidebar.data_editor(
+    pd.DataFrame(default_vegas_rows),
+    hide_index=True,
+    use_container_width=True,
+    column_config={
+        "Game": st.column_config.TextColumn("Game", disabled=True),
+        "Total": st.column_config.NumberColumn("O/U", min_value=180.0, max_value=270.0, step=0.5),
+        "Home_Spread": st.column_config.NumberColumn("Home Sprd", min_value=-30.0, max_value=30.0, step=0.5)
+    }
+)
+
+blowout_threshold = st.sidebar.slider("Blowout Spread Threshold", min_value=8.0, max_value=18.0, value=11.5, step=0.5)
+
+with st.spinner("Calculating consensus projections, Vegas ITT & pace metrics..."):
     nba_player_stats, team_pace_stats = fetch_nba_stats()
     open_proj_df = fetch_open_source_projections()
 
-# Merge DK Slate with official NBA Stats
 if not nba_player_stats.empty:
     merged_df = pd.merge(slate_df, nba_player_stats, left_on="Name", right_on="PLAYER_NAME", how="left")
 else:
@@ -518,7 +663,6 @@ else:
     merged_df["MIN"] = 0.0
     merged_df["Season_FPTS"] = 0.0
 
-# Merge with Live Open Source Daily Projections
 if not open_proj_df.empty:
     merged_df = pd.merge(merged_df, open_proj_df, on="Name", how="left")
     merged_df["MIN"] = merged_df["Open_MIN"].fillna(merged_df.get("MIN", 0.0)).fillna(0.0).round(1)
@@ -533,14 +677,14 @@ else:
     merged_df["MIN"] = merged_df.get("MIN", 0.0).fillna(0.0).round(1)
     merged_df["Base_Proj"] = merged_df.get("Season_FPTS", 0.0).replace(0, np.nan).fillna(merged_df["Salary"] / 240.0).round(2)
 
-# Dynamic baseline floor: Players priced >= $6,000 never have 0 minutes
+# Dynamic baseline floor for rotation starters
 imputed_min = np.clip((merged_df["Salary"] - 3000) / 250.0, 12.0, 34.0)
 merged_df["MIN"] = np.where(merged_df["MIN"] > 0, merged_df["MIN"], imputed_min).round(1)
 
-merged_df = apply_pace_and_matchups(merged_df, team_pace_stats)
+merged_df = apply_vegas_and_pace(merged_df, team_pace_stats, vegas_edited_df, blowout_spread=blowout_threshold)
 
 # Sidebar: Injury Scratches with CSV Auto-Detection
-st.sidebar.header("2. Injury Status (Scratches)")
+st.sidebar.header("3. Injury Status (Scratches)")
 all_names = sorted(merged_df["Name"].unique().tolist())
 
 auto_scratches = []
@@ -556,15 +700,13 @@ outs = st.sidebar.multiselect(
     default=auto_scratches
 )
 
-# Recalculate projections & parametric ceilings
 pool_df = reallocate_vacated_usage(merged_df, outs)
 
-# Minimum Minutes Filter (filters out 0-minute garbage time punts)
-st.sidebar.header("3. Quality & Minutes Filters")
-min_proj_minutes = st.sidebar.slider("Min Expected Minutes", min_value=0.0, max_value=25.0, value=12.0, step=1.0)
+# Sidebar: Quality & Minutes Filters
+st.sidebar.header("4. Quality & Minutes Filters")
+min_proj_minutes = st.sidebar.slider("Min Expected Minutes", min_value=0.0, max_value=25.0, value=15.0, step=1.0)
 pool_df = pool_df[pool_df["Adj_MIN"] >= min_proj_minutes].copy()
 
-# Guard: If filter removed too many players, preserve at least top 20 active players
 if len(pool_df) < 15:
     st.sidebar.warning("⚠️ Min Expected Minutes filter is too strict. Showing top available players.")
     pool_df = reallocate_vacated_usage(merged_df, outs).sort_values(by="Projected_FPTS", ascending=False).head(40)
@@ -572,7 +714,7 @@ if len(pool_df) < 15:
 pool_df = calculate_percentile_ceilings(pool_df)
 
 # Sidebar: Tournament Controls
-st.sidebar.header("4. GPP & Portfolio Controls")
+st.sidebar.header("5. GPP & Portfolio Controls")
 
 target_metric = st.sidebar.selectbox(
     "Optimization Objective",
@@ -585,6 +727,7 @@ target_metric = st.sidebar.selectbox(
 )
 
 min_studs_req = st.sidebar.number_input("Min Studs ($9,500+ Cap Anchors)", min_value=0, max_value=3, value=1)
+max_players_per_game = st.sidebar.slider("Max Players From Any Single Game", min_value=2, max_value=5, value=4, help="Hard cap per game. 3 or 4 prevents single-game cannibalization.")
 
 available_active = sorted(pool_df["Name"].unique())
 locks = st.sidebar.multiselect("🔒 Lock Core Players", options=available_active)
@@ -596,13 +739,12 @@ max_exp = st.sidebar.slider(
     help="0.60 means a player can appear in at most 3 of the 5 lineups."
 )
 
-valid_games = [g for g in pool_df["Game Info"].unique() if "@" in str(g)]
-slate_games = ["None"] + valid_games
+slate_games = ["None"] + slate_matchups
 game_stack = st.sidebar.selectbox("🎯 Target Game Stack", options=slate_games)
 stack_players = st.sidebar.slider("Min Players from Stacked Game", 2, 4, 3)
 
-# --- 6. TABS ---
-tab_lineups, tab_portfolio, tab_pool = st.tabs(["⚡ 5 Optimized Lineups", "📊 Exposure Breakdown", "📋 Player Pool & Projections"])
+# --- 7. TABS ---
+tab_lineups, tab_portfolio, tab_pool = st.tabs(["⚡ 5 Optimized Lineups", "📊 Exposure Breakdown", "📋 Player Pool & Vegas Projections"])
 
 with tab_lineups:
     if st.button("🚀 Generate 5 Tournament Lineups", type="primary"):
@@ -618,6 +760,7 @@ with tab_lineups:
                     max_exposure=max_exp,
                     target_stack=game_stack,
                     stack_size=stack_players,
+                    max_game_players=max_players_per_game,
                     objective_metric=target_metric,
                     min_studs=min_studs_req
                 )
@@ -632,13 +775,13 @@ with tab_lineups:
                     med_sum = l_df["Projected_FPTS"].sum().round(1)
                     sal_sum = l_df["Salary"].sum()
                     st.subheader(f"Lineup #{idx+1} — {target_sum} Target Pts (Median: {med_sum} pts | ${sal_sum:,} Salary)")
-                    
+
                     st.dataframe(
-                        l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]],
+                        l_df[["Roster Slot", "Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Vegas_ITT", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Clean_Game"]],
                         use_container_width=True,
                         hide_index=True
                     )
-                    
+
                     export_rows.append({
                         "PG": l_df[l_df["Roster Slot"] == "PG"]["Name"].values[0],
                         "SG": l_df[l_df["Roster Slot"] == "SG"]["Name"].values[0],
@@ -669,12 +812,12 @@ with tab_portfolio:
         exp_df = all_picks["Name"].value_counts().reset_index()
         exp_df.columns = ["Name", "Count"]
         exp_df["Exposure %"] = ((exp_df["Count"] / 5) * 100).round(1)
-        
-        meta = pool_df[["Name", "TeamAbbrev", "Position", "Salary", "Projected_FPTS", "Ceiling_75", "Ceiling_90"]].drop_duplicates()
+
+        meta = pool_df[["Name", "TeamAbbrev", "Position", "Salary", "Vegas_ITT", "Projected_FPTS", "Ceiling_75", "Ceiling_90"]].drop_duplicates()
         portfolio_summary = pd.merge(exp_df, meta, on="Name", how="left")
-        
+
         st.dataframe(
-            portfolio_summary[["Name", "TeamAbbrev", "Position", "Salary", "Count", "Exposure %", "Projected_FPTS", "Ceiling_75", "Ceiling_90"]],
+            portfolio_summary[["Name", "TeamAbbrev", "Position", "Salary", "Vegas_ITT", "Count", "Exposure %", "Projected_FPTS", "Ceiling_75", "Ceiling_90"]],
             use_container_width=True,
             hide_index=True
         )
@@ -682,9 +825,9 @@ with tab_portfolio:
         st.info("Click 'Generate 5 Tournament Lineups' in the first tab to view portfolio distribution.")
 
 with tab_pool:
-    st.subheader("Active Player Pool (Consensus Blend, Pace & Ceiling Metrics)")
+    st.subheader("Active Player Pool (Vegas ITT, Pace & Ceiling Metrics)")
     st.dataframe(
-        pool_df[["Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Pace_Factor", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Game Info"]]
+        pool_df[["Name", "Position", "TeamAbbrev", "Salary", "Adj_MIN", "Vegas_ITT", "Game_Spread", "Env_Mult", "Projected_FPTS", "Ceiling_75", "Ceiling_90", "Value (x/1k)", "Clean_Game"]]
         .sort_values(by=target_metric, ascending=False),
         use_container_width=True,
         hide_index=True
